@@ -30,10 +30,10 @@ class RiskManagement:
         Returns:
         - Tuple (pop, win_loss_ratio): Probability of profit and win/loss ratio
         """
-        # Calculate net premium
+        from numpy import linspace
+
         net_premium = sum(leg["premium"] * leg["quantity"] for leg in legs)
 
-        # Define payoff function
         def payoff(S_T):
             total_payoff = 0
             for leg in legs:
@@ -46,59 +46,52 @@ class RiskManagement:
                 total_payoff += leg["quantity"] * (intrinsic - leg["premium"])
             return total_payoff + net_premium
 
-        # Log-normal PDF for underlying price at expiration
         def lognormal_pdf(S_T):
-            mu = np.log(S) + (r - 0.5 * sigma**2) * T
+            mu = np.log(S) + (r - 0.5 * sigma ** 2) * T
             sigma_T = sigma * np.sqrt(T)
             if S_T <= 0:
                 return 0
             return (1 / (S_T * sigma_T * np.sqrt(2 * np.pi))) * np.exp(
-                -0.5 * ((np.log(S_T) - mu) / sigma_T)**2
+                -0.5 * ((np.log(S_T) - mu) / sigma_T) ** 2
             )
 
-        # Evaluate payoff over a price range to find profit/loss regions
-        price_range = np.linspace(S * 0.5, S * 1.5, 1000)
-        payoffs = [payoff(p) for p in price_range]
-        
-        # Identify profit regions (payoff > 0)
-        profit_regions = []
-        start = None
-        for i in range(len(price_range)):
-            if payoffs[i] > 0 and start is None:
-                start = price_range[i]
-            elif (payoffs[i] <= 0 or i == len(price_range) - 1) and start is not None:
-                end = price_range[i - 1] if i < len(price_range) - 1 else price_range[i]
-                profit_regions.append((start, end))
-                start = None
+        price_range = linspace(S * 0.5, S * 1.5, 1000)
+        dS = price_range[1] - price_range[0]
+        payoffs = np.array([payoff(p) for p in price_range])
+        pdfs = np.array([lognormal_pdf(p) for p in price_range])
 
-        # Calculate PoP by integrating over profit regions
-        pop = 0
-        for start, end in profit_regions:
-            pop += quad(lognormal_pdf, start, end)[0]
+        # Probability of profit (PoP)
+        profit_mask = payoffs > 0
+        loss_mask = payoffs < 0
 
-        if not profit_regions:
-            print(f"{self.get_timestamp()} Warning: No profit regions found.")
-            pop = 0
+        pop = np.sum(pdfs[profit_mask] * dS)
 
-        # Calculate max profit and max loss for win/loss ratio
-        max_profit = max(payoffs) if payoffs else 0
-        max_loss = -min(payoffs) if payoffs else 0
+        # Expected win/loss
+        expected_win = np.sum(payoffs[profit_mask] * pdfs[profit_mask] * dS)
+        expected_loss = -np.sum(payoffs[loss_mask] * pdfs[loss_mask] * dS)
+
+        # Avoid division by zero
+        win_loss_ratio = expected_win / expected_loss if expected_loss > 0 else 1.0
+
         self.win_probability = pop
-        self.win_loss_ratio = max_profit / max_loss if max_loss > 0 else 1.0
+        self.win_loss_ratio = win_loss_ratio
 
         print(f"{self.get_timestamp()} PoP calculated for strategy: {pop:.2%}")
-        print(f"{self.get_timestamp()} Max Profit: ${max_profit:.2f}, Max Loss: ${max_loss:.2f}")
-        print(f"{self.get_timestamp()} Win/Loss Ratio: {self.win_loss_ratio:.2f}")
+        print(f"{self.get_timestamp()} Expected Win: ${expected_win:.2f}, Expected Loss: ${expected_loss:.2f}")
+        print(f"{self.get_timestamp()} Win/Loss Ratio (expected): {win_loss_ratio:.2f}")
 
-        return pop, self.win_loss_ratio
+        return pop, win_loss_ratio
 
-    def kelly_criterion_position_sizing(self, pop=None, win_loss_ratio=None, use_kelly_sizing=True):
+
+    def kelly_criterion_position_sizing(self, pop=None, win_loss_ratio=None, use_kelly_sizing=True, fraction=1.0):
         """
-        Calculate position size using Kelly Criterion.
+        Calculate position size using Fractional Kelly Criterion.
+
         Parameters:
         - pop: Probability of profit (optional, defaults to self.win_probability)
         - win_loss_ratio: Win/loss ratio (optional, defaults to self.win_loss_ratio)
         - use_kelly_sizing: Whether to perform sizing
+        - fraction: Fraction of full Kelly (1.0 = full Kelly, 0.5 = half Kelly, etc.)
         """
         if not use_kelly_sizing:
             return 0
@@ -112,14 +105,15 @@ class RiskManagement:
             return 0
 
         q = 1 - p
-        kelly_fraction = (b * p - q) / b if b != 0 else 0
-        kelly_fraction = min(max(kelly_fraction, 0), 0.25)
-        position_size = int(np.floor(self.account_value * kelly_fraction / self.margin))
+        raw_kelly = (b * p - q) / b if b != 0 else 0
+        fractional_kelly = max(min(raw_kelly * fraction, 0.25), 0)  # Clip to 25% max to avoid overbetting
+        position_size = int(np.floor(self.account_value * fractional_kelly / self.margin))
 
         print(f"{self.get_timestamp()} Kelly Criterion calculated...\n"
-              f"{self.get_timestamp()} Win Probability: {p:.2f}, Win/Loss Ratio: {b:.2f}\n"
-              f"{self.get_timestamp()} Kelly Fraction: {kelly_fraction:.2f}\n"
-              f"{self.get_timestamp()} Trading {position_size} contracts")
+            f"{self.get_timestamp()} Win Probability: {p:.2f}, Win/Loss Ratio: {b:.2f}\n"
+            f"{self.get_timestamp()} Raw Kelly Fraction: {raw_kelly:.2f}, Fractional Kelly Applied: {fraction:.2f}\n"
+            f"{self.get_timestamp()} Final Kelly Fraction Used: {fractional_kelly:.2f}\n"
+            f"{self.get_timestamp()} Trading {position_size} contracts")
 
         return position_size
 
