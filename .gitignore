@@ -1,0 +1,9 @@
+*.duckdb
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# test files
+forward_testing.py
