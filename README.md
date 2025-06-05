@@ -1,5 +1,4 @@
 # Backtesting Framework
-
 ## Overview
 This repository contains the backtesting framework. It provides tools and utilities for testing, analyzing, and reporting on trading strategies.
 
