@@ -71,10 +71,6 @@ class _Data:
             return None
         return subset_df.loc[asof_time]
 
-    @property
-    def ticker_map(self):
-        return self._ticker_map
-
     def close(self):
         self._conn.close()
 
@@ -165,14 +161,6 @@ class Strategy(ABC):
     #         self._records[k].name = name or k # Ensure name is set
     #         self._records[k].attrs.update({'name': name or k, 'plot': plot, 'overlay': overlay,
     #                                        'color': color, 'scatter': scatter})
-
-    @property
-    def ticker_map(self):
-        return self._data._ticker_map
-    
-    @property
-    def data_template(self):
-        return self._data._data_df_template
     
     @property
     def time(self):
@@ -873,13 +861,13 @@ class Backtest:
         else: # Loop completed without break
             final_positions = ({t: p.size for t, p in broker.positions.items()}
                                    | {'Cash': int(broker.margin_available)})
-            
+        
             broker.finalize() # Close any open positions at the end
             data.close()
         
         progress_bar.close()
 
-        return processed_orders, final_positions
+        return processed_orders, final_positions, broker.closed_trades, broker.orders
     
 
 
