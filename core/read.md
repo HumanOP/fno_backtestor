@@ -1,3 +1,4 @@
+```
 sequenceDiagram
     participant User
     participant _Data
@@ -11,3 +12,4 @@ sequenceDiagram
     QuestDB-->>QuestDBClient: Raw bytes response
     QuestDBClient-->>_Data: Query result
     _Data-->>User: Data bytes
+```
