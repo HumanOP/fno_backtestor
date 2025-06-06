@@ -7,6 +7,7 @@ Please follow these guidelines to help us maintain a clean, consistent, and high
 
 ## 📁 Current Project Structure
 
+```
 repo-root/
 │
 ├── core/               # Core engine (all reusable logic)
@@ -41,6 +42,7 @@ repo-root/
 ├── requirements.txt
 ├── .gitignore
 └── setup.py
+```
 
 No other file or folder should be in the root-repo
 ---
