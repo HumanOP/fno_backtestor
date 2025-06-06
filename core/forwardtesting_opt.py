@@ -1,137 +1,21 @@
 import traceback
 import warnings
-from abc import ABC, abstractmethod
-from copy import copy
 from datetime import datetime, date as DateObject # Added DateObject
-from functools import partial # lru_cache removed
-from math import copysign
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
-import re
-import numpy as np
-import pandas as pd
-try:
-    from tqdm.auto import tqdm as _tqdm
-    _tqdm = partial(_tqdm, leave=False)
-except ImportError:
-    def _tqdm(seq, **_):
-        return seq
 
 import pandas as pd
 from typing import Dict, Optional, List
 import pandas as pd
-from questdb_query import Endpoint
 import time
 
-import asyncio
 import time
 from io import BytesIO
 
 import aiohttp
-import numpy as np
-import pandas as pd
-
-
-
-# class Endpoint:
-#     """
-#     HTTP connection parameters into QuestDB
-#     """
-#     def __init__(
-#                 self,
-#                 host='127.0.0.1',
-#                 port=None,
-#                 https=False,
-#                 username=None,
-#                 password=None,
-#                 token=None):
-#         self.host = host
-#         self.port = port or (443 if https else 9000)
-#         self.https = https
-#         self.username = username
-#         self.password = password
-#         self.token = token
-#         if ((self.username or self.password) and \
-#             not (self.username and self.password)):
-#             raise ValueError('Must provide both username and password or neither')
-#         if self.token and self.username:
-#             raise ValueError('Cannot use token with username and password')
-#         if token and not re.match(r'^[A-Za-z0-9-._~+/]+=*$', token):
-#             # https://datatracker.ietf.org/doc/html/rfc6750#section-2.1
-#             raise ValueError("Invalid characters in token")
-
-#     @property
-#     def url(self):
-#         protocol = 'https' if self.https else 'http'
-#         return f'{protocol}://{self.host}:{self.port}'
-
-# class _Data:
-#     def __init__(self, endpoint: Endpoint):
-#         self._endpoint: Endpoint = endpoint
-#         # self._time: Optional[pd.Timestamp] = None
-#         # self._spot: Optional[float] = None
-#         self.session = self._new_session(endpoint)          # Initialize connection and load table names
-
-#     def _new_session(self, endpoint, timeout: int = None):
-#         "Connect to the database and make a session."
-#         auth = None
-#         if endpoint.username:
-#             auth = aiohttp.BasicAuth(endpoint.username, endpoint.password)
-#         timeout = aiohttp.ClientTimeout(total=timeout) \
-#             or aiohttp.ClientTimeout(total=300)
-#         return aiohttp.ClientSession(
-#             auth=auth,
-#             timeout=timeout)
-
-#     def _auth_headers(endpoint: Endpoint) -> dict[str, str]:
-#         if endpoint.token:
-#             return {'Authorization': f'Bearer {endpoint.token}'}
-#         return None
-
-#     async def _data_fetching(self, query: str) -> Optional[pd.DataFrame]:
-#         url = f'{self._endpoint.url}/exp'
-#         params = [('query', query)]
-#         headers = self._auth_headers(self._endpoint)
-
-#         async with self.session.get(url=url, params=params, headers=headers) as resp:
-#             if resp.status != 200:
-#                 raise ValueError(f'Failed to query QuestDB: {resp.status} {resp.reason}')
-            
-#             buf = await resp.content.read()
-#         return buf
-
-#     def get_ticker_data(self, ticker: str) -> Optional[pd.DataFrame]:
-#         "Fetch the latest data for a given ticker."
-#         query = f"SELECT * FROM {ticker} ORDER BY timestamp DESC LIMIT 1"
-#         ticker_data = asyncio.run(self._data_fetching(query))
-#         return ticker_data
-    
-#     def close(self):
-#         self.session.close()
-
-#     def __repr__(self):
-#         return str(self.session)
-    
-
-# endpoint = Endpoint(host='qdb3.twocc.in', port=None, https=True, username='2Cents', password='2Cents1012cc')
-# data = _Data(endpoint)
-# for i in range(10):
-#     ticker_data = data.get_ticker_data('options_data')
-#     if ticker_data is not None:
-#         print(ticker_data)
-#     else:
-#         print("No data found for the ticker.")
-#     time.sleep(1)  # Sleep for a second before the next iteration
-
 import asyncio
 import time
 import re
 import atexit
 import threading
-import platform
-from abc import ABC, abstractmethod
-from typing import Optional, Dict
-
-import aiohttp
 
 
 class Endpoint:
@@ -277,44 +161,30 @@ class QuestDBClient:
             if self._loop_thread and self._loop_thread.is_alive():
                 self._loop_thread.join(timeout=5)
 
-
-
-class DataFetchStrategy(ABC):
-    """Abstract base class for data fetching strategies"""
-    @abstractmethod
-    def fetch_data(self, client: QuestDBClient, **kwargs) -> Optional[bytes]:
-        pass
-
-
-class TickerDataStrategy(DataFetchStrategy):
-    """Strategy for fetching ticker data"""
-    def fetch_data(self, client: QuestDBClient, ticker: str, limit: int = 1) -> Optional[bytes]:
-        query = f"SELECT * FROM {ticker} ORDER BY timestamp DESC LIMIT {limit}"
-        return client.execute_query(query)
-
-
 class _Data:
     """Main class for fetching data with strategies"""
     def __init__(self, endpoint: Endpoint):
-        self.client = QuestDBClient(endpoint)
-        self.strategy: Optional[DataFetchStrategy] = None
-
-    def set_strategy(self, strategy: DataFetchStrategy):
-        self.strategy = strategy
-
-    def fetch_data(self, **kwargs) -> Optional[bytes]:
-        if not self.strategy:
-            raise ValueError("No strategy set")
+        self.consumer = QuestDBClient(endpoint)
         
+    def fetch_data(self, ticker: str, limit: int = 1) -> Optional[bytes]:
+        query = f"SELECT * FROM {ticker} ORDER BY time DESC LIMIT {limit}"
         try:
-            return self.strategy.fetch_data(self.client, **kwargs)
+            return self.consumer.execute_query(query)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error fetching data for {ticker}: {e}")
             return None
 
     def cleanup(self):
-        self.client.cleanup()
+        self.consumer.cleanup()
 
+'''
+- Continuously fetch live market data for a symbol.
+- Run trading strategy logic as new data comes in.
+- Manage positions, orders, and track performance in real-time.
+- Support restarting from a previous backtest state.
+- Handle different markets and timezones.
+- Persist results and equity curves for monitoring and analysis.
+'''
 
 # Usage example
 if __name__ == "__main__":
@@ -326,15 +196,15 @@ if __name__ == "__main__":
     )
     
     fetcher = _Data(endpoint)
-    fetcher.set_strategy(TickerDataStrategy())
-    
-    for i in range(10):
+    # Get all table names
+    table_names_data = QuestDBClient(endpoint).execute_query("SHOW TABLES")
+    df = pd.read_csv(BytesIO(table_names_data))
+    table_names = df["table_name"].tolist()
+    print(table_names)
+
+    for ticker in table_names:
         start =  time.time()
-        ticker_data = fetcher.fetch_data(ticker='options_data')
-        if ticker_data:
-            print(f"Iteration {i+1}: Fetched {len(ticker_data)} bytes")
-        else:
-            print(f"Iteration {i+1}: No data")
-        end = time.time()
-        print(f"Time taken: {end - start:.2f} seconds")
-        time.sleep(1)
+        ticker_data = fetcher.fetch_data(ticker=ticker)
+        if ticker_data:    
+            end = time.time()
+            print(f"Time taken: {end - start:.5f} seconds")
