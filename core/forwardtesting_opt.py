@@ -2,6 +2,7 @@ import traceback
 import warnings
 from datetime import datetime, date as DateObject # Added DateObject
 
+from abc import ABC, abstractmethod
 import pandas as pd
 from typing import Dict, Optional, List
 import pandas as pd
@@ -17,194 +18,217 @@ import re
 import atexit
 import threading
 
+from .live_data_fetcher import _Data, Endpoint
 
-class Endpoint:
-    """HTTP connection parameters into QuestDB"""
-    def __init__(self, host='127.0.0.1', port=None, https=False, 
-                 username=None, password=None, token=None):
-        self.host = host
-        self.port = port or (443 if https else 9000)
-        self.https = https
-        self.username = username
-        self.password = password
-        self.token = token
+class Strategy(ABC):
+    def __init__(self, broker: '_Broker', _data: _Data, params: dict):
+        self._broker: _Broker = broker
+        self._data: _Data = _data
+        self._params = self._check_params(params)
+        self._records = {}
+        self._start_on_day = 0
+
+
+    def __repr__(self):
+        return '<Strategy ' + str(self) + '>'
         
-        if ((self.username or self.password) and 
-            not (self.username and self.password)):
-            raise ValueError('Must provide both username and password or neither')
-        if self.token and self.username:
-            raise ValueError('Cannot use token with username and password')
-        if token and not re.match(r'^[A-Za-z0-9-._~+/]+=*$', token):
-            raise ValueError("Invalid characters in token")
+    def _check_params(self, params):
+        for k, v in params.items():
+            if not hasattr(self, k):
+                raise AttributeError(
+                    f"Strategy '{self.__class__.__name__}' is missing parameter '{k}'."
+                    "Strategy class should define parameters as class variables before they "
+                    "can be optimized or run with.")
+            setattr(self, k, v)
+        return params
+
+    @abstractmethod
+    def init(self):
+        """Initialize the strategy. Declare spot indicators, etc."""
+        print("Initializing strategy...")
+
+    @abstractmethod
+    def next(self):
+        """
+        Called for each spot data bar AFTER options_data for the current day is loaded.
+        Access `self.spot_data` for current spot bar.
+        Access `self.options_data` for current day's option chain.
+        """
+        pass
+
+    def buy(self, *,
+        strategy_id: str,
+        position_id: str,
+        leg_id: str,
+        ticker: str,
+        quantity: float, # Number of contracts
+        stop_loss: float, take_profit: float, tag: str):
+        assert quantity > 0, "Quantity for buying options must be positive"
+        return self._broker.new_order(strategy_id, position_id, leg_id, ticker, quantity, stop_loss, take_profit, tag)
+
+    def sell(self, *,
+        strategy_id: str,
+        position_id: str,
+        leg_id: str,
+        ticker: str,
+        quantity: float, # Number of contracts
+        stop_loss: float, take_profit: float, tag: str):
+        # Negative quantity for selling (to open short or close long)
+        assert quantity > 0, "Quantity for selling options must be positive (use negative for broker call)"
+        return self._broker.new_order(strategy_id, position_id, leg_id, ticker, -quantity, stop_loss, take_profit, tag)
 
     @property
-    def url(self):
-        protocol = 'https' if self.https else 'http'
-        return f'{protocol}://{self.host}:{self.port}'
+    def time(self):
+        return time.time()
+    
+    @property
+    def spot(self):
+        return self._data._spot         # Needs redefinition to getting underlying's data
 
-class QuestDBClient:
-    """High-frequency async client for QuestDB operations"""
-    def __init__(self, endpoint: Endpoint):
-        self._endpoint = endpoint
-        self._session = None
-        self._loop = None
-        self._loop_thread = None
-        self._shutdown_event = None
-        atexit.register(self.cleanup)
+    @property
+    def tte_to_expiry(self):
+        return self._data._tte_to_expiry
 
-    def _start_event_loop(self):
-        """Start event loop in a separate thread"""
-        def run_loop():
-            # Use SelectorEventLoop on Windows for aiohttp compatibility
-            import platform
-            if platform.system() == 'Windows':
-                self._loop = asyncio.SelectorEventLoop()
-            else:
-                self._loop = asyncio.new_event_loop()
-            
-            asyncio.set_event_loop(self._loop)
-            self._shutdown_event = asyncio.Event()
-            self._loop.run_until_complete(self._shutdown_event.wait())
-            self._loop.close()
+    @property
+    def equity(self) -> float:          # MTM of all positions
+        return self._broker.equity()
 
-        self._loop_thread = threading.Thread(target=run_loop, daemon=True)
-        self._loop_thread.start()
+    def position(self, ticker: str) -> 'Position': # Now takes ticker
+        return self._broker.positions.get(ticker, Position(self._broker, ticker, 0)) # Return empty if not found
+
+    @property
+    def orders(self) -> 'List[Order]':
+        return self._broker.orders
+
+    # trades() and closed_trades() now refer to option trades
+    def trades(self, ticker: str = None) -> 'Tuple[Trade, ...]':
+        if ticker:
+            return tuple(self._broker.trades.get(ticker, []))
+        return tuple(trade for trades_list in self._broker.trades.values() for trade in trades_list)
+    
+    @property
+    def active_trades(self) -> 'Tuple[Trade, ...]':
+        return tuple(trade for trades_list in self._broker.trades.values() for trade in trades_list)
+
+
+    @property
+    def closed_trades(self) -> 'Tuple[Trade, ...]':
+        return tuple(self._broker.closed_trades)
+
+
+class _Broker():
+    def __init__():
+        pass
+
+''' Needed features/interfaces for _Broker:
+- Order placement 
+- MTM
+- Position
+- Tradebook (update_trades)
+- Positions (update_positions)
+- Orderbook (update_orderbook)
+- Margin calculator
+- Account balance
+'''
         
-        while self._loop is None:
-            time.sleep(0.01)
 
-    async def _create_session(self):
-        """Create aiohttp session with proper authentication"""
-        if self._session is not None and not self._session.closed:
-            return  # Session exists and is healthy
-            
-        auth = None
-        if self._endpoint.username:
-            auth = aiohttp.BasicAuth(self._endpoint.username, self._endpoint.password)
+class AlgoRunner:
+    """Main class to run the strategy with real-time data"""
+    def __init__(self, 
+                 endpoint: Endpoint, 
+                 strategy: Strategy, 
+                 broker: '_Broker',
+                 broker_creds: Optional[Dict[str, str]] = None,
+                 update_interval: float = 1.0,
+                 end_time: pd.Timestamp = None):
+        self.endpoint = endpoint
+        self._strategy_class = strategy
+        self._broker_factory = broker
+        self.broker_creds = broker_creds
+        self.update_interval = update_interval
+        self.end_time = end_time
+
+    def run(self, **strategy_params):
+        """Run the strategy in real-time"""
+        print("Starting forward testing...")
         
-        timeout = aiohttp.ClientTimeout(total=30)
-        self._session = aiohttp.ClientSession(auth=auth, timeout=timeout)
-
-    async def _recreate_session(self):
-        """Force recreate session (close old one and create new)"""
-        # Close existing session if it exists
-        if self._session and not self._session.closed:
-            await self._session.close()
-        
-        # Create new session
-        self._session = None
-        await self._create_session()
-        print("New session created successfully")
-
-    @staticmethod
-    def _auth_headers(endpoint: Endpoint) -> Optional[Dict[str, str]]:
-        """Generate authentication headers"""
-        if endpoint.token:
-            return {'Authorization': f'Bearer {endpoint.token}'}
-        return None
-
-    async def _execute_query_async(self, query: str, retry_count: int = 0) -> Optional[bytes]:
-        """Execute a SQL query and return raw bytes with automatic session recovery"""
-        if self._session is None or self._session.closed:
-            await self._create_session()
-
-        url = f'{self._endpoint.url}/exp'
-        params = [('query', query)]
-        headers = self._auth_headers(self._endpoint)
-
-        try:
-            async with self._session.get(url=url, params=params, headers=headers) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    raise ValueError(f'QuestDB Error {resp.status}: {error_text}')
-                return await resp.content.read()
-                
-        except (aiohttp.ClientError, aiohttp.ServerTimeoutError, 
-                aiohttp.ClientConnectionError, OSError) as e:
-            # Session might be corrupted/closed - try to recover once
-            if retry_count < 1:
-                print(f"Session error detected, creating new session: {e}")
-                await self._recreate_session()
-                return await self._execute_query_async(query, retry_count + 1)
-            else:
-                raise RuntimeError(f"Session recovery failed: {e}")
-        except Exception as e:
-            raise RuntimeError(f"Query failed: {e}")
-
-    def execute_query(self, query: str) -> Optional[bytes]:
-        """Synchronous wrapper for query execution with session recovery"""
-        if self._loop is None:
-            self._start_event_loop()
+        # Initialize components
+        self._data = _Data(self.endpoint)
+        self._broker = self._broker_factory(self.broker_creds)
+        self._strategy = self._strategy_class(self._broker, self._data, strategy_params)
         
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._execute_query_async(query), self._loop
-            )
-            return future.result(timeout=30)
+            # Initialize strategy
+            self._strategy.init()
+            print("Strategy initialized successfully")
         except Exception as e:
-            print(f"Query execution failed: {e}")
-            return None
+            print(f'Strategy initialization failed: {e}')
+            traceback.print_exc()
+            return
 
-    async def _close_session(self):
-        """Close the session"""
-        if self._session:
-            await self._session.close()
-            self._session = None
+        self._is_running = True
+        iteration_count = 0
+        
+        print("Starting main trading loop...")
+        while self._is_running:
+            try:
+                iteration_count += 1
+                loop_start_time = time.time()
+
+                # Update broker state (positions, orders, etc.)
+                self._broker.update_positions()
+                self._broker.update_orders()
+
+                # Call strategy next() method
+                try:
+                    self._strategy.next()
+                except Exception as e:
+                    print(f"Error in strategy.next(): {e}")
+                    traceback.print_exc()
+
+                # Check if end time reached
+                if self.end_time and time.time() >= self.end_time:
+                    print(f"End time reached: {self.end_time}")
+                    self._is_running = False
+                    break
+
+                # Performance monitoring
+                loop_duration = time.time() - loop_start_time
+                if iteration_count % 10 == 0:  # Log every 10 iterations
+                    print(f"Iteration {iteration_count}: {self._data._time}, "
+                          f"Loop time: {loop_duration:.3f}s")
+
+                # Sleep for remaining time
+                sleep_time = max(0, self.update_interval - loop_duration)
+                time.sleep(sleep_time)
+
+            except KeyboardInterrupt:
+                print("Received interrupt signal, stopping...")
+                self._is_running = False
+                break
+            except Exception as e:
+                print(f"Error in main loop: {e}")
+                traceback.print_exc()
+                time.sleep(self.update_interval)
+
+        print("Forward testing completed")
+        self.cleanup()
+
+    def stop(self):
+        """Stop the algorithm"""
+        self._is_running = False
 
     def cleanup(self):
         """Cleanup resources"""
-        if self._loop and not self._loop.is_closed():
-            asyncio.run_coroutine_threadsafe(
-                self._close_session(), self._loop
-            ).result(timeout=5)
-            self._loop.call_soon_threadsafe(self._shutdown_event.set)
-            if self._loop_thread and self._loop_thread.is_alive():
-                self._loop_thread.join(timeout=5)
+        if self._data:
+            self._data.cleanup()
+        print("Cleanup completed")
 
-class _Data:
-    """Main class for fetching data with strategies"""
-    def __init__(self, endpoint: Endpoint):
-        self.consumer = QuestDBClient(endpoint)
-        
-    def fetch_data(self, ticker: str, limit: int = 1) -> Optional[bytes]:
-        query = f"SELECT * FROM {ticker} ORDER BY time DESC LIMIT {limit}"
-        try:
-            return self.consumer.execute_query(query)
-        except Exception as e:
-            print(f"Error fetching data for {ticker}: {e}")
-            return None
 
-    def cleanup(self):
-        self.consumer.cleanup()
-
-'''
-- Continuously fetch live market data for a symbol.
-- Run trading strategy logic as new data comes in.
+''' Future development on AlgoRunner:
 - Manage positions, orders, and track performance in real-time.
 - Support restarting from a previous backtest state.
 - Handle different markets and timezones.
 - Persist results and equity curves for monitoring and analysis.
+- Control features like termination, pausing, and resuming, squaring off spreads/positions and squaring off current positions.
 '''
-
-# Usage example
-if __name__ == "__main__":
-    endpoint = Endpoint(
-        host='qdb3.twocc.in', 
-        https=True, 
-        username='2Cents', 
-        password='2Cents1012cc'
-    )
-    
-    fetcher = _Data(endpoint)
-    # Get all table names
-    table_names_data = QuestDBClient(endpoint).execute_query("SHOW TABLES")
-    df = pd.read_csv(BytesIO(table_names_data))
-    table_names = df["table_name"].tolist()
-    print(table_names)
-
-    for ticker in table_names:
-        start =  time.time()
-        ticker_data = fetcher.fetch_data(ticker=ticker)
-        if ticker_data:    
-            end = time.time()
-            print(f"Time taken: {end - start:.5f} seconds")
