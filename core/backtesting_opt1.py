@@ -949,7 +949,7 @@ class Backtest:
 
         # Extract equity curve and prepare series for quantstats
         equity_df = results['_equity_curve']
-        equity_series = equity_df['Equity'].pct_change().dropna()
+        equity_series = equity_df['Equity'].resample('1D').last().pct_change().dropna() #changed to daily
         
         # Create a simple benchmark (buy and hold) or use None
         # For now, we'll create a benchmark by loading data again (could be optimized)
@@ -957,21 +957,21 @@ class Backtest:
             data = _Data(self.db_path)
             # Sample some data to create a benchmark
             sample_tables = data._table_names[90:703]  # Use same range as in run method
-            benchmark_prices = []
-            benchmark_dates = []
+            daily_benchmark_data = []
             
             for table in sample_tables:
                 data.load_table(table)
                 if data._spot_table is not None and not data._spot_table.empty:
-                    benchmark_prices.extend(data._spot_table['spot_price'].values)
-                    benchmark_dates.extend(data._spot_table.index.values)
+                    # Convert minute-level data to daily by resampling
+                    daily_spot = data._spot_table['spot_price'].resample('1D').last()
+                    daily_benchmark_data.append(daily_spot)
             
             data.close()
             
-            if benchmark_prices:
-                benchmark_df = pd.Series(benchmark_prices, index=benchmark_dates)
-                benchmark_df = benchmark_df.groupby(benchmark_df.index.date).last()  # Daily prices
-                benchmark_series = benchmark_df.pct_change().dropna()
+            if daily_benchmark_data:
+                # Concatenate all daily data
+                benchmark_series = pd.concat(daily_benchmark_data).sort_index()
+                benchmark_series = benchmark_series.pct_change().dropna()
                 benchmark_series = benchmark_series.rename("Benchmark")
             else:
                 benchmark_series = None
