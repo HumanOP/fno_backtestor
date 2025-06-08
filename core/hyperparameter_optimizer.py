@@ -22,9 +22,33 @@ class HyperParameterOptimizer:
         self.legs = legs
 
     def optimize(self, hyperparameter_grid: dict, maximize: str = 'Sharpe Ratio', 
-                 method: str = 'grid', max_tries: int = None, constraint: callable = None):
+                 method: str = 'grid', start_date: str = None, end_date: str = None,
+                 max_tries: int = None, constraint: callable = None):
+        """
+        Optimize hyperparameters using grid search.
+        
+        Parameters:
+        - hyperparameter_grid: dict, parameter combinations to test
+        - maximize: str, metric to maximize (default: 'Sharpe Ratio')
+        - method: str, optimization method (only 'grid' supported)
+        - max_tries: int, maximum parameter combinations to test
+        - constraint: callable, function to filter parameter combinations
+        - start_date: str, start date for backtest window (YYYY-MM-DD format)
+        - end_date: str, end date for backtest window (YYYY-MM-DD format)
+        
+        Returns:
+        - best_params: dict, best parameter combination
+        - best_score: float, best metric value
+        - results_df: pd.DataFrame, all results
+        """
         if method != 'grid':
             raise ValueError("Only 'grid' method is supported in this implementation")
+            
+        # Log the optimization window if specified
+        if start_date or end_date:
+            print(f"Optimizing on date window: {start_date} to {end_date}")
+        else:
+            print("Optimizing on full dataset")
         param_keys = list(hyperparameter_grid.keys())
         param_values = [hyperparameter_grid[key] for key in param_keys]
         param_combinations = [dict(zip(param_keys, combo)) for combo in product(*param_values)]
@@ -35,12 +59,14 @@ class HyperParameterOptimizer:
             param_combinations = param_combinations[:max_tries]
         if not param_combinations:
             raise ValueError("No admissible parameter combinations to test")
+            
+        print(f"Total parameter combinations to test: {len(param_combinations)}")
         results = []
         best_sharpe = -np.inf
         best_params = None
 
-        for flat_params in param_combinations:
-            print(f"Testing parameters: {flat_params}")
+        for idx, flat_params in enumerate(param_combinations, 1):
+            print(f"Testing parameters {idx}/{len(param_combinations)}: {flat_params}")
 
             # Construct the full parameter dictionary
             params = {
@@ -55,23 +81,50 @@ class HyperParameterOptimizer:
                 "legs": self.legs  # Pass legs as a parameter
             }
 
-            backtest = self._backtest_factory()
-            result = backtest.optimize(**params)
-            print(f"results : {result}")
+            try:
+                backtest = self._backtest_factory()
+                
+                # Use run_window if date range is specified, otherwise use regular run
+                if start_date is not None or end_date is not None:
+                    result = backtest.run_window(start_date=start_date, end_date=end_date, **params)
+                else:
+                    result = backtest.run(**params)
+                    
+                print(f"Results: {result}")
 
-            if maximize not in result or pd.isna(result[maximize]):
-                print(f"Invalid result for parameters {flat_params}: {result}")
+                if maximize not in result or pd.isna(result[maximize]):
+                    print(f"Invalid result for parameters {flat_params}: missing or NaN {maximize}")
+                    continue
+
+                sharpe_ratio = result[maximize]
+                results.append({**flat_params, 'Sharpe Ratio': sharpe_ratio})
+                print(f"Sharpe ratio: {sharpe_ratio}")
+
+                if sharpe_ratio > best_sharpe:
+                    best_sharpe = sharpe_ratio
+                    best_params = params  # Store the full params dict
+                    print(f"New best Sharpe ratio: {best_sharpe}")
+                    
+            except Exception as e:
+                print(f"Error testing parameters {flat_params}: {e}")
                 continue
 
-            sharpe_ratio = result[maximize]
-            results.append({**flat_params, 'Sharpe Ratio': sharpe_ratio})
-            print(f"Sharpe ratio: {sharpe_ratio}")
-
-            if sharpe_ratio > best_sharpe:
-                best_sharpe = sharpe_ratio
-                best_params = params  # Store the full params dict
-
         results_df = pd.DataFrame(results)
+        
+        # Print optimization summary
+        if results:
+            print(f"\n=== Optimization Complete ===")
+            print(f"Tested {len(param_combinations)} parameter combinations")
+            print(f"Valid results: {len(results)}")
+            print(f"Best {maximize}: {best_sharpe:.4f}")
+            print(f"Best parameters: {best_params}")
+            
+            if len(results) > 1:
+                print(f"Worst {maximize}: {min(results, key=lambda x: x['Sharpe Ratio'])['Sharpe Ratio']:.4f}")
+                print(f"Average {maximize}: {results_df['Sharpe Ratio'].mean():.4f}")
+        else:
+            print("Warning: No valid results found during optimization")
+        
         # timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         # output_directory_path = os.path.join(os.getcwd(), f'hyperparameter_optimizer_output_{timestamp}')
         # os.makedirs(output_directory_path, exist_ok=True)
