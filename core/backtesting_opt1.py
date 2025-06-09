@@ -822,9 +822,106 @@ class Backtest:
         self._strategy = strategy
         self._results: Optional[pd.Series] = None
 
-    def run(self, **kwargs) -> pd.Series:
+    def run_window(self, start_date: str = None, end_date: str = None, **kwargs) -> pd.Series:
+        """
+        Run backtest for a specific date window.
+        
+        Parameters:
+        - start_date: Start date in 'YYYY-MM-DD' format (inclusive)
+        - end_date: End date in 'YYYY-MM-DD' format (inclusive)
+        - **kwargs: Strategy parameters
+        
+        Returns:
+        - pd.Series: Backtest statistics
+        """
         data = _Data(self.db_path)
-        data._table_names = data._table_names[90:703] # For testing, load only a few tables
+        
+        # Filter tables based on date window if provided
+        if start_date or end_date:
+            filtered_tables = self._filter_tables_by_date(data._table_names, start_date, end_date)
+            if not filtered_tables:
+                raise ValueError(f"No tables found for date range {start_date} to {end_date}")
+            data._table_names = filtered_tables
+            print(f"Running backtest for {len(filtered_tables)} tables from {start_date} to {end_date}")
+        else:
+            # Use the same subset as original run method for consistency
+            data._table_names = data._table_names[90:703]
+        
+        # Filter out date parameters that shouldn't go to strategy
+        strategy_kwargs = {k: v for k, v in kwargs.items() if k not in ['start_date', 'end_date']}
+        
+        return self._run_backtest_core(data, **strategy_kwargs)
+    
+    def _filter_tables_by_date(self, table_names: list, start_date: str = None, end_date: str = None) -> list:
+        """
+        Filter table names based on date range by querying actual timestamp data in each table.
+        
+        Parameters:
+        - table_names: List of table names to filter
+        - start_date: Start date in 'YYYY-MM-DD' format (inclusive)
+        - end_date: End date in 'YYYY-MM-DD' format (inclusive)
+        
+        Returns:
+        - List of table names that contain data within the specified date range
+        """
+        if not start_date and not end_date:
+            return table_names
+        
+        # Convert date strings to pandas timestamps for comparison
+        start_ts = pd.to_datetime(start_date) if start_date else None
+        end_ts = pd.to_datetime(end_date) if end_date else None
+        
+        filtered_tables = []
+        data = _Data(self.db_path)
+        
+        try:
+            for table_name in table_names:
+                try:
+                    # Query the table to get min and max timestamps
+                    query = f"""
+                    SELECT 
+                        MIN(timestamp) as min_timestamp,
+                        MAX(timestamp) as max_timestamp
+                    FROM {table_name}
+                    """
+                    result = data._conn.execute(query).fetchone()
+                    
+                    if result and result[0] is not None and result[1] is not None:
+                        table_min_date = pd.to_datetime(result[0])
+                        table_max_date = pd.to_datetime(result[1])
+                        
+                        # Check if table's date range overlaps with requested range
+                        include_table = True
+                        
+                        if start_ts is not None and table_max_date.date() < start_ts.date():
+                            include_table = False
+                        
+                        if end_ts is not None and table_min_date.date() > end_ts.date():
+                            include_table = False
+                        
+                        if include_table:
+                            filtered_tables.append(table_name)
+                            print(f"Including table {table_name}: data from {table_min_date.date()} to {table_max_date.date()}")
+                        else:
+                            print(f"Excluding table {table_name}: data from {table_min_date.date()} to {table_max_date.date()}")
+                    else:
+                        print(f"Warning: Table {table_name} has no timestamp data or is empty")
+                        
+                except Exception as e:
+                    print(f"Warning: Could not query table {table_name}: {e}")
+                    # Include table if we can't determine its date range (conservative approach)
+                    filtered_tables.append(table_name)
+                    
+        finally:
+            data.close()
+        
+        print(f"Filtered {len(filtered_tables)} tables out of {len(table_names)} total tables")
+        return filtered_tables
+    
+    def _run_backtest_core(self, data: _Data, **kwargs) -> pd.Series:
+        """
+        Core backtesting logic shared between run() and run_window().
+        """
         broker: _Broker = self._broker_factory(data=data)
         strategy: Strategy = self._strategy(broker, data, kwargs)
         processed_orders: List[Order] = []
@@ -920,13 +1017,21 @@ class Backtest:
 
         # return processed_orders, final_positions, broker.closed_trades, broker.orders
         return stats
+    
+    def run(self, **kwargs) -> pd.Series:
+        """
+        Run backtest on default date range (for backward compatibility).
+        """
+        data = _Data(self.db_path)
+        data._table_names = data._table_names[90:703] # For testing, load only a few tables
+        return self._run_backtest_core(data, **kwargs)
 
-    def optimize(self, **params) -> pd.Series:
-        """
-        Run the backtest with given parameters and compute performance metrics.
-        """
-        stats = self.run(**params)
-        return stats
+    # def optimize(self, **params) -> pd.Series:
+    #     """
+    #     Run the backtest with given parameters and compute performance metrics.
+    #     """
+    #     stats = self.run(**params)
+    #     return stats
 
     def tear_sheet(self, *, results: pd.Series = None, plotting_date=None, filename=None, open_browser=True, output_path=None):
         """
