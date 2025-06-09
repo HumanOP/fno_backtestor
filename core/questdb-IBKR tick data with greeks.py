@@ -1,0 +1,365 @@
+
+import asyncio
+import nest_asyncio
+import logging
+import random
+import requests
+import os
+import pandas as pd
+from datetime import datetime
+from ib_async import IB, Index, Option
+from questdb.ingress import Sender, IngressError, TimestampNanos
+
+# Patch asyncio for Jupyter-style environments
+nest_asyncio.apply()
+
+# Configure logging with console and file output (UTF-8 encoding)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("option_chain_listener.log", encoding="utf-8")
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Store data globally
+option_data = []
+
+class OptionChainListener:
+    def __init__(
+        self,
+        ib_client: IB,
+        *,
+        underlying_symbol: str = "NIFTY50",
+        exchange: str = "NSE",
+        currency: str = "INR",
+        strike_range: float = 400,
+        questdb_host: str = None,
+        questdb_port: str = None,
+        questdb_username: str = None,
+        questdb_password: str = None,
+    ):
+        self.ib = ib_client
+        self.underlying_symbol = underlying_symbol
+        self.exchange = exchange
+        self.currency = currency
+        self.strike_range = strike_range
+        self.option_data = option_data
+        self.tickers = []
+        self.pending_rows = []
+        self.last_flush = None
+
+        # QuestDB connection settings
+        self.questdb_host = questdb_host or os.getenv("QUESTDB_HOST", "localhost")
+        self.questdb_port = questdb_port or os.getenv("QUESTDB_PORT", "9009")
+        self.questdb_username = questdb_username or os.getenv("QUESTDB_USERNAME", "admin")
+        self.questdb_password = questdb_password or os.getenv("QUESTDB_PASSWORD", "quest")
+        self.questdb_conf = (
+            f"https::addr={self.questdb_host}:{self.questdb_port};"
+            f"username={self.questdb_username};"
+            f"password={self.questdb_password};"
+            f"connect_timeout=5000;"
+        )
+
+        self.sender: Sender = None
+        self.running = False
+        self.table_created = False
+
+    async def fetch_current_price(self, underlying: Index) -> float:
+        ticker = self.ib.reqMktData(underlying)
+        await asyncio.sleep(1)
+        price = ticker.last or ticker.close
+        logger.info(f"Underlying {self.underlying_symbol} spot = {price}")
+        return price
+
+    async def create_table(self):
+        """Create a single table for all option contracts."""
+        if self.table_created:
+            return
+
+        url = f"https://{self.questdb_host}:443/exec"
+        ddl = '''
+        CREATE TABLE IF NOT EXISTS option_chain (
+            symbol SYMBOL,
+            strike DOUBLE,
+            right SYMBOL,
+            expiry STRING,
+            last DOUBLE,
+            bid DOUBLE,
+            ask DOUBLE,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            volume DOUBLE,
+            call_volume DOUBLE,
+            put_volume DOUBLE,
+            call_open_interest DOUBLE,
+            put_open_interest DOUBLE,
+            model_price DOUBLE,
+            delta DOUBLE,
+            gamma DOUBLE,
+            vega DOUBLE,
+            theta DOUBLE,
+            implied_vol DOUBLE,
+            ts TIMESTAMP
+        ) TIMESTAMP(ts) PARTITION BY DAY;
+        '''.strip()
+
+        try:
+            response = requests.get(
+                url,
+                params={"query": ddl},
+                auth=(self.questdb_username, self.questdb_password),
+                timeout=5
+            )
+            if response.status_code == 200:
+                self.table_created = True
+                logger.info("Created table option_chain")
+            else:
+                logger.error(f"DDL error: {response.status_code} / {response.text}")
+        except requests.RequestException as e:
+            logger.error(f"Failed to create table: {e}")
+
+    async def ensure_sender(self):
+        """Ensure Sender is connected, retry if necessary."""
+        if self.sender is not None and self.running:
+            try:
+                self.sender.flush()
+                logger.debug("Sender connection verified")
+                return
+            except IngressError as e:
+                logger.warning(f"Sender disconnected (error: {e}), attempting reconnect")
+                try:
+                    self.sender.close()
+                except Exception:
+                    pass
+                self.sender = None
+                self.running = False
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Connecting to QuestDB (attempt {attempt + 1}/{max_retries}): {self.questdb_conf}")
+                self.sender = Sender.from_conf(self.questdb_conf)
+                self.sender.flush()
+                self.running = True
+                logger.info("Connected to QuestDB sender")
+                return
+            except Exception as e:
+                logger.error(f"Connection attempt {attempt + 1} failed: {e}")
+                self.sender = None
+                self.running = False
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+        logger.error("Failed to connect to QuestDB after retries")
+        self.running = False
+
+    async def _upload_to_qdb(self, rows: list):
+        """Upload a batch of rows to QuestDB."""
+        await self.ensure_sender()
+        if not self.running or self.sender is None:
+            logger.warning("Skipping upload: sender not connected")
+            return
+
+        if not self.table_created:
+            await self.create_table()
+            if not self.table_created:
+                logger.error("Skipping upload: table creation failed")
+                return
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            def do_write():
+                try:
+                    for row in rows:
+                        self.sender.row(
+                            "option_chain",
+                            symbols={"symbol": row["Symbol"], "right": row["Right"]},
+                            columns={
+                                "strike": row["Strike"],
+                                "expiry": row["Expiration"],
+                                "last": row["Last"],
+                                "bid": row["Bid"],
+                                "ask": row["Ask"],
+                                "open": row["Open"],
+                                "high": row["High"],
+                                "low": row["Low"],
+                                "close": row["Close"],
+                                "volume": row["Volume"],
+                                "call_volume": row["CallVolume"],
+                                "put_volume": row["PutVolume"],
+                                "call_open_interest": row["CallOpenInterest"],
+                                "put_open_interest": row["PutOpenInterest"],
+                                "model_price": row["ModelPrice"],
+                                "delta": row["Delta"],
+                                "gamma": row["Gamma"],
+                                "vega": row["Vega"],
+                                "theta": row["Theta"],
+                                "implied_vol": row["ImpliedVol"],
+                            },
+                            at=TimestampNanos.from_datetime(row["Time"])
+                        )
+                    self.sender.flush()
+                    logger.debug(f"Uploaded {len(rows)} rows to option_chain")
+                except IngressError as e:
+                    logger.error(f"Upload error: {e}")
+                    self.running = False
+                except Exception as e:
+                    logger.error(f"Unexpected error uploading: {e}")
+
+            await loop.run_in_executor(None, do_write)
+        except Exception as e:
+            logger.error(f"Upload task error: {e}")
+
+    def on_tick(self, ticker):
+        """IB callback for market-data updates."""
+        greeks = ticker.modelGreeks or type("G", (), {})()
+        now = datetime.utcnow()
+        is_call = ticker.contract.right == "C"
+        row = {
+            "Time": now,
+            "Symbol": ticker.contract.localSymbol,
+            "Strike": ticker.contract.strike,
+            "Right": ticker.contract.right,
+            "Expiration": ticker.contract.lastTradeDateOrContractMonth,
+            "Last": ticker.last if ticker.last is not None else None,
+            "Bid": ticker.bid if ticker.bid is not None else None,
+            "Ask": ticker.ask if ticker.ask is not None else None,
+            "Open": ticker.open if ticker.open is not None else None,
+            "High": ticker.high if ticker.high is not None else None,
+            "Low": ticker.low if ticker.low is not None else None,
+            "Close": ticker.close if ticker.close is not None else None,
+            "Volume": ticker.volume if ticker.volume is not None else None,
+            "CallVolume": ticker.callVolume if is_call and ticker.callVolume is not None else None,
+            "PutVolume": ticker.putVolume if not is_call and ticker.putVolume is not None else None,
+            "CallOpenInterest": ticker.callOpenInt if is_call and ticker.callOpenInt is not None else None,
+            "PutOpenInterest": ticker.putOpenInt if not is_call and ticker.putOpenInt is not None else None,
+            "ModelPrice": getattr(greeks, "optPrice", None),
+            "Delta": getattr(greeks, "delta", None),
+            "Gamma": getattr(greeks, "gamma", None),
+            "Vega": getattr(greeks, "vega", None),
+            "Theta": getattr(greeks, "theta", None),
+            "ImpliedVol": getattr(greeks, "impliedVol", None),
+        }
+
+        # Validate required fields
+        required_fields = ["Symbol", "Right", "Strike", "Expiration", "Time"]
+        if any(row.get(field) is None for field in required_fields):
+            logger.error(f"Invalid row: missing required fields {row}")
+            return
+
+        # Store data
+        self.option_data.append(row)
+        self.pending_rows.append(row)
+
+        # Batch QuestDB upload every 0.5 seconds
+        if self.last_flush is None or (now - self.last_flush).total_seconds() >= 0.5:
+            asyncio.create_task(self._upload_to_qdb(self.pending_rows))
+            self.pending_rows = []
+            self.last_flush = now
+
+    async def print_data(self):
+        """Periodically print option chain data."""
+        while True:
+            if self.option_data:
+                df = pd.DataFrame(self.option_data)
+                pd.set_option('display.max_columns', None)
+                pd.set_option('display.width', 1000)
+                pd.set_option('display.float_format', '{:.2f}'.format)
+                print("\n=== Option Chain Data ===")
+                print(df.tail(30)[[
+                    'Time', 'Symbol', 'Strike', 'Right', 'Expiration', 'Bid', 'Ask', 'Last',
+                    'Volume', 'CallVolume', 'PutVolume', 'CallOpenInterest', 'PutOpenInterest',
+                    'Delta', 'Gamma', 'Theta', 'ImpliedVol'
+                ]])
+                print("========================\n")
+            await asyncio.sleep(10)
+
+    async def start_listening(self, client_id: int = 14, max_retries: int = 3, retry_delay: int = 2):
+        """Main connection loop with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Connecting to TWS (clientId={client_id})")
+                self.ib.connect("127.0.0.1", 7497, clientId=client_id)
+                logger.info("Connected to TWS")
+
+                await self.ensure_sender()
+                if not self.running:
+                    raise Exception("Failed to connect to QuestDB")
+
+                underlying = Index(self.underlying_symbol, self.exchange, self.currency)
+                self.ib.qualifyContracts(underlying)
+
+                current_price = await self.fetch_current_price(underlying)
+                atm_strike = round(current_price / 50) * 50
+
+                opt_params = self.ib.reqSecDefOptParams(
+                    underlying.symbol, "", underlying.secType, underlying.conId
+                )
+                if not opt_params:
+                    logger.error("Failed to retrieve option chain parameters")
+                    raise Exception("No option chain parameters")
+
+                chain_info = opt_params[0]
+                expirations = sorted(chain_info.expirations)[:3]
+                strikes = sorted(chain_info.strikes)
+                selected_strikes = [s for s in strikes if abs(s - atm_strike) <= self.strike_range]
+
+                option_contracts = [
+                    Option(self.underlying_symbol, exp, strike, right, self.exchange, currency=self.currency)
+                    for exp in expirations
+                    for strike in selected_strikes
+                    for right in ["C", "P"]
+                ]
+
+                self.ib.qualifyContracts(*option_contracts)
+                logger.info(f"Qualified {len(option_contracts)} option contracts")
+
+                self.tickers = [self.ib.reqMktData(contract, genericTickList="106,100,101") for contract in option_contracts]
+                for ticker in self.tickers:
+                    ticker.updateEvent += self.on_tick
+
+                logger.info(f"Subscribed to {len(self.tickers)} contracts")
+
+                # Start printing data in parallel
+                asyncio.create_task(self.print_data())
+
+                # Keep running
+                while True:
+                    await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+                if "clientid" in str(e).lower() and attempt < max_retries - 1:
+                    client_id = random.randint(1, 100)
+                    await asyncio.sleep(retry_delay)
+                    continue
+                raise
+            finally:
+                self.running = False
+                if self.sender:
+                    try:
+                        self.sender.close()
+                        logger.info("QuestDB sender closed")
+                    except Exception as e:
+                        logger.error(f"Error closing QuestDB sender: {e}")
+                self.ib.disconnect()
+                logger.info("TWS disconnected")
+
+async def main():
+    ib = IB()
+    listener = OptionChainListener(
+        ib_client=ib,
+        questdb_host="qdb3.twocc.in",
+        questdb_port="443",
+        questdb_username="2Cents",
+        questdb_password="2Cents1012cc"
+    )
+    await listener.start_listening()
+
+if __name__ == "__main__":
+    asyncio.run(main())
