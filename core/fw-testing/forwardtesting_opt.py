@@ -19,6 +19,7 @@ import atexit
 import threading
 
 from .live_data_fetcher import _Data, Endpoint
+from ibkr_broker_adapter import IBKRBrokerAdapter, _Broker
 
 class Strategy(ABC):
     def __init__(self, broker: '_Broker', _data: _Data, params: dict):
@@ -115,10 +116,6 @@ class Strategy(ABC):
     # def closed_trades(self) -> 'Tuple[Trade, ...]':
     #     return tuple(self._broker.closed_trades)
 
-
-class _Broker():
-    def __init__():
-        pass
 
 ''' Needed features/interfaces for _Broker:
 - Order placement 
