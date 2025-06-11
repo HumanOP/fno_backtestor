@@ -103,6 +103,75 @@ class _Data:
     def close(self):
         self._conn.close()
 
+    def get_spot_prices(self, start_date: str, end_date: str) -> Optional[pd.Series]:
+        """
+        Get spot prices for a given duration from start_date to end_date.
+        
+        Parameters:
+        - start_date: Start date in 'YYYY-MM-DD' format (inclusive)
+        - end_date: End date in 'YYYY-MM-DD' format (inclusive)
+        
+        Returns:
+        - pd.Series: Series with datetime index and spot prices, or None if no data found
+        """
+        if not start_date or not end_date:
+            return None
+        
+        # Convert date strings to pandas timestamps for comparison
+        start_ts = pd.to_datetime(start_date)
+        end_ts = pd.to_datetime(end_date)
+        
+        all_spot_data = []
+        
+        # Process each table to extract spot data within the date range
+        for table_name in self._table_names:
+            try:
+                # Query to get spot data for this table within date range
+                query = f"""
+                SELECT timestamp, spot_price 
+                FROM {table_name} 
+                WHERE timestamp >= '{start_date}' AND timestamp <= '{end_date}'
+                ORDER BY timestamp
+                """
+                
+                result_df = self._conn.execute(query).fetchdf()
+                
+                if not result_df.empty:
+                    # Set timestamp as index and extract spot prices
+                    result_df.set_index('timestamp', inplace=True)
+                    spot_series = result_df['spot_price']
+                    
+                    # Remove duplicates by keeping the last value for each timestamp
+                    spot_series = spot_series[~spot_series.index.duplicated(keep='last')]
+                    
+                    all_spot_data.append(spot_series)
+                    
+                else:
+                    print(f" Table {table_name}: No data in date range")
+                    
+            except Exception as e:
+                print(f" Table {table_name}: Error - {e}")
+                continue
+        
+        if not all_spot_data:
+            print("  No spot data found for the specified date range")
+            return None
+        
+        # Concatenate all spot data
+        combined_spot_data = pd.concat(all_spot_data)
+        
+        # Sort by timestamp and remove any remaining duplicates
+        combined_spot_data = combined_spot_data.sort_index()
+        combined_spot_data = combined_spot_data[~combined_spot_data.index.duplicated(keep='last')]
+        
+        # Filter to exact date range (in case there are minor timestamp differences)
+        combined_spot_data = combined_spot_data[
+            (combined_spot_data.index >= start_ts) & 
+            (combined_spot_data.index <= end_ts)
+        ]
+        
+        return combined_spot_data
+
     def __repr__(self):
         # keys = list(self._cache.keys())
         # return f"<Data cached_tables={keys} current_time_range={[self._current_index[0], self._current_index[-1]] if self._current_index is not None else None}>"
@@ -1057,33 +1126,41 @@ class Backtest:
         equity_df = results['_equity_curve']
         equity_series = equity_df['Equity'].resample('1D').last().pct_change().dropna() #changed to daily
         
-        # Create a simple benchmark (buy and hold) or use None
-        # For now, we'll create a benchmark by loading data again (could be optimized)
-        try:
-            data = _Data(self.db_path)
-            # Sample some data to create a benchmark
-            sample_tables = data._table_names[90:203]  # Use same range as in run method
-            daily_benchmark_data = []
-            
-            for table in sample_tables:
-                data.load_table(table)
-                if data._spot_table is not None and not data._spot_table.empty:
-                    # Convert minute-level data to daily by resampling
-                    daily_spot = data._spot_table['spot_price'].resample('1D').last()
-                    daily_benchmark_data.append(daily_spot)
-            
-            data.close()
-            
-            if daily_benchmark_data:
-                # Concatenate all daily data
-                benchmark_series = pd.concat(daily_benchmark_data).sort_index()
-                benchmark_series = benchmark_series.pct_change().dropna()
-                benchmark_series = benchmark_series.rename("Benchmark")
-            else:
+        # Check if benchmark is already provided in results, otherwise create one
+        benchmark_series = None
+        if '_benchmark' in results and results['_benchmark'] is not None:
+            benchmark_series = results['_benchmark']
+            print(f"Using provided benchmark with {len(benchmark_series)} data points")
+        else:
+            # Create a simple benchmark (buy and hold) or use None
+            # For now, we'll create a benchmark by loading data again (could be optimized)
+            try:
+                data = _Data(self.db_path)
+                # Sample some data to create a benchmark
+                sample_tables = data._table_names[90:203]  # Use same range as in run method
+                daily_benchmark_data = []
+                
+                for table in sample_tables:
+                    data.load_table(table)
+                    if data._spot_table is not None and not data._spot_table.empty:
+                        # Convert minute-level data to daily by resampling
+                        daily_spot = data._spot_table['spot_price'].resample('1D').last()
+                        daily_benchmark_data.append(daily_spot)
+                
+                data.close()
+                
+                if daily_benchmark_data:
+                    # Concatenate all daily data
+                    benchmark_series = pd.concat(daily_benchmark_data).sort_index()
+                    benchmark_series = benchmark_series.pct_change().dropna()
+                    benchmark_series = benchmark_series.rename("Benchmark")
+                    print(f"Created default benchmark with {len(benchmark_series)} data points")
+                else:
+                    benchmark_series = None
+                    print("No benchmark data available")
+            except Exception as e:
+                print(f"Warning: Could not create benchmark data: {e}")
                 benchmark_series = None
-        except Exception as e:
-            print(f"Warning: Could not create benchmark data: {e}")
-            benchmark_series = None
         
         current_dir = os.getcwd()
         if output_path is None:
@@ -1362,10 +1439,10 @@ class Backtest:
             with open(html_file_path, 'w', encoding='utf-8') as f:
                 f.write(new_html_content)
             
-            print("✅ Trade logs successfully added to HTML tearsheet")
+            print("Trade logs successfully added to HTML tearsheet")
             
         except Exception as e:
-            print(f"❌ Warning: Could not append trade logs to HTML file: {e}")
+            print(f" Warning: Could not append trade logs to HTML file: {e}")
             # Create a separate trade logs HTML file as fallback
             trade_logs_file = html_file_path.replace('.html', '_trade_logs.html')
             try:
@@ -1384,9 +1461,9 @@ class Backtest:
                     </body>
                     </html>
                     """)
-                print(f"📄 Trade logs saved to separate file: {trade_logs_file}")
+                print(f" Trade logs saved to separate file: {trade_logs_file}")
             except Exception as e2:
-                print(f"❌ Could not create separate trade logs file: {e2}")
+                print(f" Could not create separate trade logs file: {e2}")
 
     def generate_trade_logs(self, *, results: pd.Series = None, output_path=None, file_format='csv'):
         """
