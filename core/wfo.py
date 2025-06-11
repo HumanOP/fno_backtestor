@@ -89,6 +89,11 @@ class WalkForwardOptimizer:
         results = []
         out_sample_performances = []
         
+        # Collect all out-sample data for consolidated tearsheet
+        all_out_sample_equity_curves = []
+        all_out_sample_trades = []
+        out_sample_periods = []
+        
         if not self.windows:
             raise ValueError("No valid walk-forward windows found. Check your date range and month parameters.")
         
@@ -222,6 +227,22 @@ class WalkForwardOptimizer:
             results.append(window_result)
             out_sample_performances.append(out_sample_performance)
             
+            # Collect out-sample data for consolidated tearsheet
+            if out_sample_results is not None:
+                # Extract equity curve and trades from out-sample results
+                equity_curve = out_sample_results.get('_equity_curve')
+                trades_data = out_sample_results.get('_trades')
+                
+                if equity_curve is not None and not equity_curve.empty:
+                    all_out_sample_equity_curves.append(equity_curve)
+                
+                if trades_data is not None and not trades_data.empty:
+                    all_out_sample_trades.append(trades_data)
+                
+                out_sample_periods.append((out_sample_start, out_sample_end))
+                
+                print(f" Collected out-sample data: {len(equity_curve)} equity points, {len(trades_data)} trades")
+            
             print(f"Window {window_idx + 1}/{len(self.windows)} completed successfully!")
             print(f"   Remaining windows: {len(self.windows) - (window_idx + 1)}")
             
@@ -262,6 +283,22 @@ class WalkForwardOptimizer:
         print(f"\nBest performing window: {best_window_idx + 1}")
         print(f"Best window out-sample period: {best_result['out_sample_period'][0]} to {best_result['out_sample_period'][1]}")
         print(f"Best parameters: {best_params}")
+        
+        # Generate consolidated tearsheet from all out-sample periods
+        if all_out_sample_equity_curves and all_out_sample_trades:
+            print("\n" + "="*70)
+            print(" GENERATING OUT-SAMPLE TEARSHEET")
+            print("="*70)
+            self._generate_tearsheet(
+                all_out_sample_equity_curves,
+                all_out_sample_trades,
+                out_sample_periods,
+                best_params,
+                avg_out_sample_performance,
+                results
+            )
+        else:
+            print("\n No out-sample data available for tearsheet generation")
         
         # Create comprehensive output
         wfo_output = {
@@ -340,3 +377,223 @@ class WalkForwardOptimizer:
         
         print(f"\n Walk-Forward Optimization completed successfully!")
         return best_params, avg_out_sample_performance, results
+
+    def _generate_tearsheet(self, all_out_sample_equity_curves, all_out_sample_trades, out_sample_periods, 
+                                         best_params, avg_out_sample_performance, results):
+        """
+        Generate a tearsheet from all out-sample periods by concatenating 
+        equity curves and trades, then using existing tearsheet functionality.
+        
+        Parameters:
+        - all_out_sample_equity_curves: List of equity curves from out-sample periods
+        - all_out_sample_trades: List of trades from out-sample periods  
+        - out_sample_periods: List of out-sample periods
+        - best_params: Best parameters from WFO
+        - avg_out_sample_performance: Average out-sample performance
+        - results: List of all window results
+        """
+        try:
+            print(" Concatenating equity curves from all out-sample periods...")
+            print(f"   Number of equity curves to concatenate: {len(all_out_sample_equity_curves)}")
+            
+            # Debug: Check the structure of equity curves
+            for i, eq_curve in enumerate(all_out_sample_equity_curves):
+                print(f"   Equity curve {i+1}: {type(eq_curve)}, shape: {eq_curve.shape if hasattr(eq_curve, 'shape') else 'N/A'}")
+                print(f"      Columns: {eq_curve.columns.tolist() if hasattr(eq_curve, 'columns') else 'N/A'}")
+            
+            # Concatenate all equity curves
+            consolidated_equity_curve = pd.concat(all_out_sample_equity_curves, ignore_index=False)
+            consolidated_equity_curve = consolidated_equity_curve.sort_index()
+            
+            # Handle duplicate timestamps by taking the last value (in case of overlaps)
+            if consolidated_equity_curve.index.duplicated().any():
+                print(" Found duplicate timestamps, taking last values...")
+                consolidated_equity_curve = consolidated_equity_curve.groupby(consolidated_equity_curve.index).last()
+            
+            print(" Concatenating trades from all out-sample periods...")
+            print(f"   Number of trade DataFrames to concatenate: {len(all_out_sample_trades)}")
+            
+            # Debug: Check the structure of trades
+            for i, trades in enumerate(all_out_sample_trades):
+                print(f"   Trades {i+1}: {type(trades)}, shape: {trades.shape if hasattr(trades, 'shape') else 'N/A'}")
+                print(f"      Columns: {trades.columns.tolist() if hasattr(trades, 'columns') else 'N/A'}")
+            
+            # Concatenate all trades 
+            consolidated_trades = pd.concat(all_out_sample_trades, ignore_index=True)
+            
+            # Sort trades by entry time if available
+            if 'EntryTime' in consolidated_trades.columns:
+                consolidated_trades = consolidated_trades.sort_values('EntryTime')
+            elif 'EntryBar' in consolidated_trades.columns:
+                consolidated_trades = consolidated_trades.sort_values('EntryBar')
+            
+            # Create consolidated results object matching the format expected by tearsheet
+            print(" Computing consolidated statistics...")
+            try:
+                from stats import compute_stats
+                
+                consolidated_results = compute_stats(
+                    orders=[],  # We don't have orders, only completed trades
+                    trades=consolidated_trades,
+                    equity_curve=consolidated_equity_curve
+                )
+                
+                print(" Statistics computed successfully")
+                print(f"   Available stats keys: {list(consolidated_results.keys())}")
+                
+            except Exception as stats_error:
+                print(f" Error computing stats: {stats_error}")
+                # Create a minimal results object manually
+                consolidated_results = pd.Series({
+                    '_equity_curve': consolidated_equity_curve,
+                    '_trades': consolidated_trades,
+                    'Sharpe Ratio': 0.0,  # Placeholder
+                    'Total Trades': len(consolidated_trades),
+                    'Start': consolidated_equity_curve.index.min(),
+                    'End': consolidated_equity_curve.index.max()
+                })
+                print(" Created minimal results object")
+            
+            # Add WFO-specific metadata
+            consolidated_results['WFO_Windows'] = len(results)
+            consolidated_results['WFO_Avg_Performance'] = avg_out_sample_performance
+            consolidated_results['WFO_Best_Params'] = best_params
+            consolidated_results['WFO_Period_Start'] = out_sample_periods[0][0] if out_sample_periods else None
+            consolidated_results['WFO_Period_End'] = out_sample_periods[-1][1] if out_sample_periods else None
+            
+            print(" Creating backtest instance for tearsheet generation...")
+            
+            # Create a backtest instance to use its tearsheet functionality
+            backtest = Backtest(
+                db_path=self.duckdb,
+                strategy=self.strategy,
+                cash=self.cash,
+                commission_per_contract=self.commission_per_contract,
+                option_multiplier=self.option_multiplier
+            )
+            
+            # Create benchmark using the new get_spot_prices_for_duration method
+            print(" Creating benchmark series for out-sample periods...")
+            benchmark_series = None
+            try:
+                from backtesting_opt1 import _Data
+                
+                # Get the actual date range from the consolidated equity curve
+                start_date = consolidated_equity_curve.index.min().strftime('%Y-%m-%d')
+                end_date = consolidated_equity_curve.index.max().strftime('%Y-%m-%d')
+                print(f"   Benchmark date range: {start_date} to {end_date}")
+                
+                # Use the new method to get spot prices for the duration
+                data = _Data(self.duckdb)
+                spot_data = data.get_spot_prices(start_date, end_date)
+                data.close()
+                
+                if spot_data is not None and not spot_data.empty:
+                    print(f"   Retrieved spot data: {len(spot_data)} data points")
+                    print(f"   Spot data range: {spot_data.index.min()} to {spot_data.index.max()}")
+                    
+                    # Convert to daily data by resampling to 1D interval
+                    daily_spot = spot_data.resample('1D').last().dropna()
+                    print(f"   Daily spot data after resampling: {len(daily_spot)} data points")
+                    
+                    if not daily_spot.empty:
+                        # Calculate returns for benchmark
+                        benchmark_series = daily_spot.pct_change().dropna()
+                        benchmark_series = benchmark_series.rename("Benchmark")
+                        
+                        print(f" Benchmark created: {len(benchmark_series)} daily returns")
+                        print(f"   Benchmark range: {benchmark_series.index.min()} to {benchmark_series.index.max()}")
+                        print(f"   Sample benchmark values: {benchmark_series.head(3).tolist()}")
+                        print(f"   Benchmark stats: mean={benchmark_series.mean():.6f}, std={benchmark_series.std():.6f}")
+                    else:
+                        print(" No daily spot data available after resampling")
+                        benchmark_series = None
+                else:
+                    print(" No spot data found for the out-sample date range")
+                    benchmark_series = None
+                    
+            except Exception as benchmark_error:
+                print(f" Could not create benchmark: {benchmark_error}")
+                import traceback
+                traceback.print_exc()
+                benchmark_series = None
+            
+            # Generate tearsheet filename
+            strategy_name = getattr(self.strategy, '__name__', 'Strategy')
+            tearsheet_filename = f"WFO_Consolidated_OutSample_{strategy_name}.html"
+            
+            print(f" Generating consolidated tearsheet: {tearsheet_filename}")
+            print(f"   Results type: {type(consolidated_results)}")
+            print(f"   Results keys: {list(consolidated_results.keys()) if hasattr(consolidated_results, 'keys') else 'N/A'}")
+            print(f"   Benchmark available: {'Yes' if benchmark_series is not None else 'No'}")
+            
+            # Generate the tearsheet using existing functionality
+            try:
+                # Debug: Print detailed information about results structure
+                print(f" Results structure before tearsheet:")
+                print(f"   Type: {type(consolidated_results)}")
+                print(f"   Keys: {list(consolidated_results.keys()) if hasattr(consolidated_results, 'keys') else 'No keys'}")
+                
+                if '_equity_curve' in consolidated_results:
+                    eq_curve = consolidated_results['_equity_curve']
+                    print(f"   Equity curve type: {type(eq_curve)}")
+                    print(f"   Equity curve shape: {eq_curve.shape if hasattr(eq_curve, 'shape') else 'No shape'}")
+                    print(f"   Equity curve columns: {eq_curve.columns.tolist() if hasattr(eq_curve, 'columns') else 'No columns'}")
+                    print(f"   Equity curve index range: {eq_curve.index.min()} to {eq_curve.index.max()}")
+                    print(f"   Sample equity values: {eq_curve.head(3) if hasattr(eq_curve, 'head') else 'Cannot show sample'}")
+                
+                if '_trades' in consolidated_results:
+                    trades = consolidated_results['_trades']
+                    print(f"   Trades type: {type(trades)}")
+                    print(f"   Trades shape: {trades.shape if hasattr(trades, 'shape') else 'No shape'}")
+                    print(f"   Trades columns: {trades.columns.tolist() if hasattr(trades, 'columns') else 'No columns'}")
+                
+                # Set the benchmark in the backtest instance if we have one
+                if benchmark_series is not None:
+                    # Store benchmark for tearsheet generation
+                    consolidated_results['_benchmark'] = benchmark_series
+                    print(f"   Added benchmark to consolidated_results with {len(benchmark_series)} data points")
+                    print(f"   Benchmark sample values: {benchmark_series.head(3).tolist()}")
+                    print(f"   Benchmark date range: {benchmark_series.index.min()} to {benchmark_series.index.max()}")
+                else:
+                    print("    No benchmark available - tearsheet will be generated without benchmark")
+                
+                print(f" Calling tear_sheet method...")
+                backtest.tear_sheet(
+                    results=consolidated_results,
+                    filename=tearsheet_filename,
+                    open_browser=True,
+                    generate_trade_logs=True
+                )
+                
+            except Exception as tearsheet_error:
+                print(f" Error type: {type(tearsheet_error).__name__}")
+                print(" Tearsheet method call failed. Checking method availability...")
+                print(f"   Backtest instance methods: {[method for method in dir(backtest) if not method.startswith('_')]}")
+                
+                # Print full traceback for debugging
+                import traceback
+                traceback.print_exc()
+                
+                # Try to see if quantstats is available
+                try:
+                    import quantstats_lumi as quantstats
+                    print(f" quantstats_lumi is available: {quantstats.__version__}")
+                except ImportError as qs_error:
+                    print(f" quantstats_lumi import error: {qs_error}")
+                
+                raise tearsheet_error
+            
+        except Exception as e:
+            import traceback
+            backtest.tear_sheet(
+                results=consolidated_results,
+                filename=tearsheet_filename,
+                open_browser=True,
+                generate_trade_logs=True
+            )
+            
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
