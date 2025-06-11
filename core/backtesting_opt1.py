@@ -11,6 +11,7 @@ from math import copysign
 from numbers import Number
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 import webbrowser
+from stats import compute_stats
 
 try:
     # Patch the problematic magic method before importing quantstats
@@ -40,7 +41,6 @@ except ImportError:
     quantstats = None
     warnings.warn("quantstats not installed. tear_sheet method will not work unless quantstats is installed.")
 
-from stats import compute_stats
 import numpy as np
 import pandas as pd
 try:
@@ -845,7 +845,7 @@ class Backtest:
             print(f"Running backtest for {len(filtered_tables)} tables from {start_date} to {end_date}")
         else:
             # Use the same subset as original run method for consistency
-            data._table_names = data._table_names[90:703]
+            data._table_names = data._table_names[90:203]
         
         # Filter out date parameters that shouldn't go to strategy
         strategy_kwargs = {k: v for k, v in kwargs.items() if k not in ['start_date', 'end_date']}
@@ -1023,7 +1023,7 @@ class Backtest:
         Run backtest on default date range (for backward compatibility).
         """
         data = _Data(self.db_path)
-        data._table_names = data._table_names[90:703] # For testing, load only a few tables
+        data._table_names = data._table_names[90:203] # For testing, load only a few tables
         return self._run_backtest_core(data, **kwargs)
 
     # def optimize(self, **params) -> pd.Series:
@@ -1033,7 +1033,7 @@ class Backtest:
     #     stats = self.run(**params)
     #     return stats
 
-    def tear_sheet(self, *, results: pd.Series = None, plotting_date=None, filename=None, open_browser=True, output_path=None):
+    def tear_sheet(self, *, results: pd.Series = None, plotting_date=None, filename=None, open_browser=True, output_path=None, generate_trade_logs=True):
         """
         Generate a detailed tear sheet report using quantstats.
         
@@ -1043,6 +1043,7 @@ class Backtest:
         - filename: str, the file path to save the HTML report. Default is 'tearsheet.html'.
         - open_browser: bool, whether to open the report in a browser. Default is True.
         - output_path: str, the directory path to save the HTML report. Default is current directory.
+        - generate_trade_logs: bool, whether to automatically generate detailed trade logs. Default is True.
         """
         if quantstats is None:
             raise ImportError("quantstats is required for tear_sheet. Install it using `pip install quantstats-lumi`.")
@@ -1061,7 +1062,7 @@ class Backtest:
         try:
             data = _Data(self.db_path)
             # Sample some data to create a benchmark
-            sample_tables = data._table_names[90:703]  # Use same range as in run method
+            sample_tables = data._table_names[90:203]  # Use same range as in run method
             daily_benchmark_data = []
             
             for table in sample_tables:
@@ -1094,16 +1095,448 @@ class Backtest:
             equity_series = equity_series[equity_series.index >= plotting_date]
             benchmark_series = benchmark_series[benchmark_series.index >= plotting_date]
 
+        # Enhanced trade logs - prepare detailed trade data for quantstats
+        trades_df = results['_trades']
+        
+        # Create detailed trade logs with additional information
+        detailed_trade_logs = None
+        transactions_df = None
+        
+        if not trades_df.empty:
+            detailed_trade_logs = trades_df.copy()
+            
+            # Add additional columns for better trade analysis
+            if 'EntryTag' in detailed_trade_logs.columns:
+                detailed_trade_logs['Entry_Reason'] = detailed_trade_logs['EntryTag']
+            if 'ExitTag' in detailed_trade_logs.columns:
+                detailed_trade_logs['Exit_Reason'] = detailed_trade_logs['ExitTag']
+            
+            # Calculate trade duration in days if Duration column exists
+            if 'Duration' in detailed_trade_logs.columns:
+                detailed_trade_logs['Duration_Days'] = detailed_trade_logs['Duration'].dt.days
+            
+            # Calculate win/loss ratios
+            detailed_trade_logs['Win'] = detailed_trade_logs['PnL'] > 0
+            
+            # Add trade sequence numbers
+            detailed_trade_logs['Trade_Number'] = range(1, len(detailed_trade_logs) + 1)
+            
+            # Add trade size classification (if applicable)
+            if 'PnL' in detailed_trade_logs.columns:
+                pnl_abs = detailed_trade_logs['PnL'].abs()
+                detailed_trade_logs['Trade_Size_Category'] = pd.cut(
+                    pnl_abs, 
+                    bins=3, 
+                    labels=['Small', 'Medium', 'Large']
+                )
+            
+            # Format trades for quantstats - ensure proper column names and data types
+            # QuantStats expects specific column names for trade display
+            trades_for_qs = detailed_trade_logs.copy()
+            
+            # Rename columns to match quantstats expectations
+            column_mapping = {
+                'EntryTime': 'entry_date',
+                'ExitTime': 'exit_date', 
+                'PnL': 'pnl',
+                'ReturnPct': 'return_pct',
+                'Duration': 'duration'
+            }
+            
+            # Apply column mapping
+            for old_col, new_col in column_mapping.items():
+                if old_col in trades_for_qs.columns:
+                    trades_for_qs[new_col] = trades_for_qs[old_col]
+            
+            # Ensure dates are properly formatted
+            if 'entry_date' in trades_for_qs.columns:
+                trades_for_qs['entry_date'] = pd.to_datetime(trades_for_qs['entry_date'])
+            if 'exit_date' in trades_for_qs.columns:
+                trades_for_qs['exit_date'] = pd.to_datetime(trades_for_qs['exit_date'])
+            
+            # Create transactions dataframe in the format quantstats expects
+            # This helps with displaying individual transactions
+            transactions_list = []
+            for _, trade in trades_for_qs.iterrows():
+                # Entry transaction
+                if 'entry_date' in trade and pd.notna(trade['entry_date']):
+                    transactions_list.append({
+                        'date': trade['entry_date'],
+                        'symbol': getattr(trade, 'Ticker', 'TRADE'),
+                        'qty': abs(getattr(trade, 'Size', 1)),
+                        'price': getattr(trade, 'EntryPrice', 0),
+                        'side': 'BUY' if getattr(trade, 'Size', 1) > 0 else 'SELL',
+                        'trade_num': trade.get('Trade_Number', 0)
+                    })
+                
+                # Exit transaction
+                if 'exit_date' in trade and pd.notna(trade['exit_date']):
+                    transactions_list.append({
+                        'date': trade['exit_date'],
+                        'symbol': getattr(trade, 'Ticker', 'TRADE'),
+                        'qty': abs(getattr(trade, 'Size', 1)),
+                        'price': getattr(trade, 'ExitPrice', 0),
+                        'side': 'SELL' if getattr(trade, 'Size', 1) > 0 else 'BUY',
+                        'trade_num': trade.get('Trade_Number', 0)
+                    })
+            
+            if transactions_list:
+                transactions_df = pd.DataFrame(transactions_list)
+                transactions_df['date'] = pd.to_datetime(transactions_df['date'])
+                transactions_df = transactions_df.sort_values('date')
+            
+            detailed_trade_logs = trades_for_qs
+
+        # Prepare additional parameters for quantstats
+        # Create a summary of orders/transactions for the period
+        additional_stats = {}
+        if results is not None:
+            # Add strategy information
+            additional_stats['Strategy_Name'] = getattr(results.get('_strategy'), '__class__.__name__', 'Unknown')
+            additional_stats['Total_Trades'] = len(trades_df) if not trades_df.empty else 0
+            additional_stats['Winning_Trades'] = len(trades_df[trades_df['PnL'] > 0]) if not trades_df.empty else 0
+            additional_stats['Losing_Trades'] = len(trades_df[trades_df['PnL'] <= 0]) if not trades_df.empty else 0
+            
+            if len(trades_df) > 0:
+                additional_stats['Win_Rate'] = (additional_stats['Winning_Trades'] / additional_stats['Total_Trades']) * 100
+                additional_stats['Average_Trade_PnL'] = trades_df['PnL'].mean()
+                additional_stats['Best_Trade'] = trades_df['PnL'].max()
+                additional_stats['Worst_Trade'] = trades_df['PnL'].min()
+
+        # Create a custom HTML section for trades if quantstats doesn't display them properly
+        trade_log_html = ""
+        if detailed_trade_logs is not None and not detailed_trade_logs.empty:
+            # Generate HTML table for trade logs
+            trade_log_html = self._create_trade_log_html(detailed_trade_logs)
+
         quantstats.reports.html(
             equity_series,
             benchmark=benchmark_series,
             output=tear_sheet_path,
-            _trade_start_bar=results['_trade_start_bar'],
-            trade_stats=results,
-            trade_table=results['_trades'],
-            backtest=self,
+            title=f"Strategy Tearsheet - {additional_stats.get('Strategy_Name', 'Unknown')}",
+            trades=detailed_trade_logs if detailed_trade_logs is not None else None,
+            transactions=transactions_df if transactions_df is not None else None,
         )
+        
+        # If quantstats doesn't show trade logs properly, append them to the HTML
+        if trade_log_html and os.path.exists(tear_sheet_path):
+            self._append_trade_logs_to_html(tear_sheet_path, trade_log_html, additional_stats)
 
-        print("Tearsheet generation completed.")
+        print("Tearsheet generation completed with enhanced trade logs.")
+        print(f"Trade logs include: {', '.join(detailed_trade_logs.columns.tolist()) if detailed_trade_logs is not None else 'No trade logs to display'}")
+        
+        # Generate detailed trade logs if requested
+        if generate_trade_logs and detailed_trade_logs is not None and not detailed_trade_logs.empty:
+            print("\nGenerating detailed trade logs...")
+            try:
+                log_files = self.generate_trade_logs(results=results, output_path=output_path, file_format='both')
+                if log_files:
+                    print(f"Trade logs generated successfully: {log_files}")
+            except Exception as e:
+                print(f"Warning: Could not generate trade logs: {e}")
+        
         if open_browser:
             webbrowser.open(f'file://{tear_sheet_path}')
+
+    def _create_trade_log_html(self, trades_df):
+        """Create HTML table for trade logs."""
+        if trades_df.empty:
+            return ""
+        
+        # Select key columns for display
+        display_columns = []
+        preferred_columns = [
+            'Trade_Number', 'entry_date', 'exit_date', 'Ticker', 'Size', 
+            'EntryPrice', 'ExitPrice', 'pnl', 'return_pct', 'Duration_Days',
+            'Win', 'Entry_Reason', 'Exit_Reason'
+        ]
+        
+        for col in preferred_columns:
+            if col in trades_df.columns:
+                display_columns.append(col)
+        
+        # Use available columns if preferred ones don't exist
+        if not display_columns:
+            display_columns = trades_df.columns.tolist()[:10]  # Limit to first 10 columns
+        
+        trades_display = trades_df[display_columns].copy()
+        
+        # Format the data for better display
+        for col in trades_display.columns:
+            if 'date' in col.lower() and trades_display[col].dtype == 'datetime64[ns]':
+                trades_display[col] = trades_display[col].dt.strftime('%Y-%m-%d %H:%M')
+            elif 'price' in col.lower() or 'pnl' in col.lower():
+                if trades_display[col].dtype in ['float64', 'float32']:
+                    trades_display[col] = trades_display[col].round(2)
+        
+        # Generate HTML table
+        html = f"""
+        <div class="trade-logs-section" style="margin-top: 30px;">
+            <h2 style="color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px;">
+                📋 Detailed Trade Logs
+            </h2>
+            <div style="overflow-x: auto; margin-top: 20px;">
+                {trades_display.to_html(classes='trade-logs-table', table_id='tradeLogsTable', escape=False)}
+            </div>
+        </div>
+        <style>
+        .trade-logs-table {{
+            border-collapse: collapse;
+            width: 100%;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+        }}
+        .trade-logs-table th {{
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            border: 1px solid #ddd;
+        }}
+        .trade-logs-table td {{
+            padding: 8px;
+            border: 1px solid #ddd;
+            text-align: left;
+        }}
+        .trade-logs-table tr:nth-child(even) {{
+            background-color: #f2f2f2;
+        }}
+        .trade-logs-table tr:hover {{
+            background-color: #e8f5e8;
+        }}
+        </style>
+        """
+        
+        return html
+
+    def _append_trade_logs_to_html(self, html_file_path, trade_log_html, additional_stats):
+        """Append trade logs to the existing quantstats HTML file."""
+        try:
+            # Read the existing HTML file
+            with open(html_file_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            
+            # Create trade summary stats HTML
+            stats_html = ""
+            if additional_stats:
+                stats_html = f"""
+                <div class="trade-summary-section" style="margin-top: 20px; margin-bottom: 20px;">
+                    <h3 style="color: #333;">📊 Trade Summary Statistics</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 15px;">
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #4CAF50;">
+                            <strong>Total Trades:</strong> {additional_stats.get('Total_Trades', 'N/A')}
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #2196F3;">
+                            <strong>Win Rate:</strong> {additional_stats.get('Win_Rate', 0):.1f}%
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #FF9800;">
+                            <strong>Average Trade P&L:</strong> {additional_stats.get('Average_Trade_PnL', 0):.2f}
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #4CAF50;">
+                            <strong>Best Trade:</strong> {additional_stats.get('Best_Trade', 0):.2f}
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #F44336;">
+                            <strong>Worst Trade:</strong> {additional_stats.get('Worst_Trade', 0):.2f}
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #9C27B0;">
+                            <strong>Winning Trades:</strong> {additional_stats.get('Winning_Trades', 0)}
+                        </div>
+                    </div>
+                </div>
+                """
+            
+            # Find the best place to insert the trade logs (before the closing body tag)
+            insertion_point = html_content.rfind('</body>')
+            if insertion_point == -1:
+                insertion_point = html_content.rfind('</html>')
+            if insertion_point == -1:
+                insertion_point = len(html_content)
+            
+            # Insert the trade logs and stats
+            full_trade_section = stats_html + trade_log_html
+            new_html_content = (html_content[:insertion_point] + 
+                              full_trade_section + 
+                              html_content[insertion_point:])
+            
+            # Write the updated HTML file
+            with open(html_file_path, 'w', encoding='utf-8') as f:
+                f.write(new_html_content)
+            
+            print("✅ Trade logs successfully added to HTML tearsheet")
+            
+        except Exception as e:
+            print(f"❌ Warning: Could not append trade logs to HTML file: {e}")
+            # Create a separate trade logs HTML file as fallback
+            trade_logs_file = html_file_path.replace('.html', '_trade_logs.html')
+            try:
+                with open(trade_logs_file, 'w', encoding='utf-8') as f:
+                    f.write(f"""
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>Trade Logs</title>
+                        <meta charset="utf-8">
+                    </head>
+                    <body>
+                        <h1>Trade Logs</h1>
+                        {stats_html}
+                        {trade_log_html}
+                    </body>
+                    </html>
+                    """)
+                print(f"📄 Trade logs saved to separate file: {trade_logs_file}")
+            except Exception as e2:
+                print(f"❌ Could not create separate trade logs file: {e2}")
+
+    def generate_trade_logs(self, *, results: pd.Series = None, output_path=None, file_format='csv'):
+        """
+        Generate detailed trade logs as separate files (CSV/Excel) for comprehensive analysis.
+        
+        Parameters:
+        - results: pd.Series, the backtest results. If None, uses the last run results.
+        - output_path: str, the directory path to save the trade logs. Default is current directory.
+        - file_format: str, format to save ('csv', 'excel', 'both'). Default is 'csv'.
+        """
+        if results is None:
+            if self._results is None:
+                raise RuntimeError('First issue `backtest.run()` to obtain results.')
+            results = self._results
+
+        trades_df = results['_trades']
+        
+        if trades_df.empty:
+            print("No trades found to generate logs.")
+            return None
+
+        # Create enhanced trade logs
+        detailed_logs = trades_df.copy()
+        
+        # Add comprehensive trade analysis columns
+        if 'EntryTime' in detailed_logs.columns and 'ExitTime' in detailed_logs.columns:
+            detailed_logs['Entry_Date'] = pd.to_datetime(detailed_logs['EntryTime']).dt.date
+            detailed_logs['Exit_Date'] = pd.to_datetime(detailed_logs['ExitTime']).dt.date
+            detailed_logs['Entry_Time'] = pd.to_datetime(detailed_logs['EntryTime']).dt.time
+            detailed_logs['Exit_Time'] = pd.to_datetime(detailed_logs['ExitTime']).dt.time
+            
+        # Add trade performance metrics
+        detailed_logs['Win'] = detailed_logs['PnL'] > 0
+        detailed_logs['Loss'] = detailed_logs['PnL'] <= 0
+        detailed_logs['Trade_Number'] = range(1, len(detailed_logs) + 1)
+        
+        # Calculate cumulative metrics
+        detailed_logs['Cumulative_PnL'] = detailed_logs['PnL'].cumsum()
+        detailed_logs['Running_Win_Rate'] = detailed_logs['Win'].expanding().mean() * 100
+        
+        # Add trade size analysis
+        if 'PnL' in detailed_logs.columns:
+            pnl_abs = detailed_logs['PnL'].abs()
+            detailed_logs['Trade_Size_Category'] = pd.cut(
+                pnl_abs, 
+                bins=3, 
+                labels=['Small', 'Medium', 'Large']
+            )
+            
+        # Add percentage returns if possible
+        if 'EntryPrice' in detailed_logs.columns and 'ExitPrice' in detailed_logs.columns:
+            detailed_logs['Return_Pct'] = ((detailed_logs['ExitPrice'] - detailed_logs['EntryPrice']) / 
+                                         detailed_logs['EntryPrice'] * 100)
+        
+        # Add trade duration analysis
+        if 'Duration' in detailed_logs.columns:
+            detailed_logs['Duration_Days'] = detailed_logs['Duration'].dt.days
+            detailed_logs['Duration_Hours'] = detailed_logs['Duration'].dt.total_seconds() / 3600
+            
+        # Set output directory
+        current_dir = os.getcwd()
+        if output_path is None:
+            output_path = current_dir
+            
+        # Create trade logs directory if it doesn't exist
+        trade_logs_dir = os.path.join(output_path, 'trade_logs')
+        os.makedirs(trade_logs_dir, exist_ok=True)
+        
+        # Generate timestamp for unique filenames
+        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        strategy_name = getattr(results.get('_strategy'), '__class__.__name__', 'Unknown')
+        
+        # Save files based on format preference
+        saved_files = []
+        
+        if file_format in ['csv', 'both']:
+            csv_filename = os.path.join(trade_logs_dir, f'trade_logs_{strategy_name}_{timestamp}.csv')
+            detailed_logs.to_csv(csv_filename, index=False)
+            saved_files.append(csv_filename)
+            print(f"Trade logs saved to CSV: {csv_filename}")
+        
+        if file_format in ['excel', 'both']:
+            excel_filename = os.path.join(trade_logs_dir, f'trade_logs_{strategy_name}_{timestamp}.xlsx')
+            
+            # Create Excel file with multiple sheets
+            with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+                # Main trade logs
+                detailed_logs.to_excel(writer, sheet_name='Trade_Logs', index=False)
+                
+                # Summary statistics
+                summary_stats = self._generate_trade_summary(detailed_logs)
+                summary_stats.to_excel(writer, sheet_name='Summary_Stats', index=True)
+                
+                # Monthly/Weekly breakdown if applicable
+                if 'Entry_Date' in detailed_logs.columns:
+                    monthly_stats = self._generate_monthly_breakdown(detailed_logs)
+                    monthly_stats.to_excel(writer, sheet_name='Monthly_Breakdown', index=True)
+            
+            saved_files.append(excel_filename)
+            print(f"Trade logs saved to Excel: {excel_filename}")
+        
+        # Print summary statistics
+        print("\n=== Trade Log Summary ===")
+        print(f"Total Trades: {len(detailed_logs)}")
+        print(f"Winning Trades: {detailed_logs['Win'].sum()}")
+        print(f"Losing Trades: {detailed_logs['Loss'].sum()}")
+        print(f"Win Rate: {detailed_logs['Win'].mean() * 100:.2f}%")
+        print(f"Total PnL: {detailed_logs['PnL'].sum():.2f}")
+        print(f"Average Trade PnL: {detailed_logs['PnL'].mean():.2f}")
+        print(f"Best Trade: {detailed_logs['PnL'].max():.2f}")
+        print(f"Worst Trade: {detailed_logs['PnL'].min():.2f}")
+        
+        return saved_files
+    
+    def _generate_trade_summary(self, trades_df):
+        """Generate summary statistics from trade logs."""
+        summary = pd.Series({
+            'Total_Trades': len(trades_df),
+            'Winning_Trades': trades_df['Win'].sum(),
+            'Losing_Trades': trades_df['Loss'].sum(),
+            'Win_Rate_Pct': trades_df['Win'].mean() * 100,
+            'Total_PnL': trades_df['PnL'].sum(),
+            'Average_Trade_PnL': trades_df['PnL'].mean(),
+            'Median_Trade_PnL': trades_df['PnL'].median(),
+            'Best_Trade': trades_df['PnL'].max(),
+            'Worst_Trade': trades_df['PnL'].min(),
+            'PnL_Std_Dev': trades_df['PnL'].std(),
+            'Average_Winner': trades_df[trades_df['Win']]['PnL'].mean() if trades_df['Win'].any() else 0,
+            'Average_Loser': trades_df[trades_df['Loss']]['PnL'].mean() if trades_df['Loss'].any() else 0,
+            'Profit_Factor': (trades_df[trades_df['Win']]['PnL'].sum() / 
+                            abs(trades_df[trades_df['Loss']]['PnL'].sum())) if trades_df['Loss'].any() else float('inf'),
+        })
+        
+        if 'Duration_Days' in trades_df.columns:
+            summary['Average_Trade_Duration_Days'] = trades_df['Duration_Days'].mean()
+            summary['Median_Trade_Duration_Days'] = trades_df['Duration_Days'].median()
+        
+        return summary
+    
+    def _generate_monthly_breakdown(self, trades_df):
+        """Generate monthly breakdown of trade performance."""
+        if 'Entry_Date' not in trades_df.columns:
+            return pd.DataFrame()
+            
+        trades_df['Entry_Month'] = pd.to_datetime(trades_df['Entry_Date']).dt.to_period('M')
+        
+        monthly_stats = trades_df.groupby('Entry_Month').agg({
+            'PnL': ['count', 'sum', 'mean'],
+            'Win': ['sum', 'mean']
+        }).round(2)
+        
+        monthly_stats.columns = ['Trade_Count', 'Total_PnL', 'Avg_PnL', 'Winning_Trades', 'Win_Rate']
+        return monthly_stats
