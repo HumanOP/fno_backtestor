@@ -10,7 +10,29 @@ def _data_period(index):
     return diff if not pd.isna(diff) else pd.Timedelta(days=1)
 
 def compute_drawdown_duration_peaks(dd: pd.Series):
-    iloc = np.unique(np.r_[(dd == 0).values.nonzero()[0], len(dd) - 1])
+    # Handle empty series
+    if len(dd) == 0:
+        return (pd.Series(dtype='timedelta64[ns]'), pd.Series(dtype='float64'))
+    
+    # Find zero crossings and end point
+    zero_points = (dd == 0).values.nonzero()[0]
+    if len(zero_points) == 0:
+        # No zero points found, return empty series with proper index
+        empty_duration = pd.Series(dtype='timedelta64[ns]', index=dd.index)
+        empty_peaks = pd.Series(dtype='float64', index=dd.index)
+        return empty_duration, empty_peaks
+    
+    iloc = np.unique(np.r_[zero_points, len(dd) - 1])
+    
+    # Ensure all indices are within bounds
+    iloc = iloc[iloc < len(dd)]
+    
+    if len(iloc) == 0:
+        # No valid indices, return empty series
+        empty_duration = pd.Series(dtype='timedelta64[ns]', index=dd.index)
+        empty_peaks = pd.Series(dtype='float64', index=dd.index)
+        return empty_duration, empty_peaks
+    
     iloc = pd.Series(iloc, index=dd.index[iloc])
     df = iloc.to_frame('iloc').assign(prev=iloc.shift())
     df = df[df['iloc'] > df['prev'] + 1].astype(int)
@@ -45,6 +67,42 @@ def compute_stats(
 
     index = equity_curve.index
     equity = equity_curve.rename("Equity").to_frame()
+
+    # Handle empty equity curve
+    if len(index) == 0:
+        # Return empty stats with NaN values
+        return pd.Series({
+            'Start': pd.NaT,
+            'End': pd.NaT,
+            'Duration': pd.NaT,
+            'Total Trades': 0,
+            'Win Rate [%]': np.nan,
+            'Avg Trade Return [%]': np.nan,
+            'Best Trade [%]': np.nan,
+            'Worst Trade [%]': np.nan,
+            'Profit Factor': np.nan,
+            'Expectancy [%]': np.nan,
+            'Kelly Criterion': np.nan,
+            'SQN': np.nan,
+            'Max Trade Duration': pd.NaT,
+            'Avg Trade Duration': pd.NaT,
+            'Final Equity': np.nan,
+            'Initial Equity': np.nan,
+            'Return [%]': np.nan,
+            'Return (Ann.) [%]': np.nan,
+            'Volatility (Ann.) [%]': np.nan,
+            'Sharpe Ratio': np.nan,
+            'Sortino Ratio': np.nan,
+            'Calmar Ratio': np.nan,
+            'Max Drawdown [%]': np.nan,
+            'Avg Drawdown [%]': np.nan,
+            'Max Drawdown Duration [days]': np.nan,
+            'Avg Drawdown Duration [days]': np.nan,
+            '_strategy': strategy_instance,
+            '_equity_curve': equity,
+            '_trades': pd.DataFrame(),
+            '_positions': positions
+        })
 
     cummax = np.maximum.accumulate(equity['Equity'])
     dd = 1 - equity['Equity'] / cummax
