@@ -11,10 +11,10 @@ import re
 import atexit
 import threading
 import logging
-from backtesting_opt import Trade, Order, Position
+from core.backtesting_opt import Trade, Order, Position
 from live_data_fetcher import _Data, Endpoint
-from ib_async import Contract, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, Order, Fill
-from ib_insync import IB
+from ib_async import IB, Contract, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, Order, Fill
+# from ib_insync import IB
 import pytz
 
 class IBKRBrokerAdapter:
