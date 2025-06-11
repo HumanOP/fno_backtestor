@@ -19,10 +19,13 @@ import atexit
 import threading
 
 from .live_data_fetcher import _Data, Endpoint
-from ibkr_broker_adapter import IBKRBrokerAdapter, _Broker
+from ibkr_broker_adapter import _Broker
 
 class Strategy(ABC):
-    def __init__(self, broker: '_Broker', _data: _Data, params: dict):
+    def __init__(self, 
+                 broker: _Broker, 
+                 _data: _Data, 
+                 params: dict):
         self._broker: _Broker = broker
         self._data: _Data = _data
         self._params = self._check_params(params)
@@ -134,12 +137,12 @@ class AlgoRunner:
     def __init__(self, 
                  endpoint: Endpoint, 
                  strategy: Strategy, 
-                 broker: '_Broker',
+                 broker: _Broker,
                  broker_creds: Optional[Dict[str, str]] = None,
                  update_interval: float = 1.0,
                  end_time: pd.Timestamp = None):
         self.endpoint = endpoint
-        self._strategy_class = strategy
+        self._strategy = strategy
         self._broker_factory = broker
         self.broker_creds = broker_creds
         self.update_interval = update_interval
@@ -152,7 +155,7 @@ class AlgoRunner:
         # Initialize components
         self._data = _Data(self.endpoint)
         self._broker = self._broker_factory(self.broker_creds)
-        self._strategy = self._strategy_class(self._broker, self._data, strategy_params)
+        self._strategy = self._strategy(self._broker, self._data, strategy_params)
         
         try:
             # Initialize strategy
