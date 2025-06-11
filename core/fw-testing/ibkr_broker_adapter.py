@@ -247,7 +247,7 @@ class IBKRBrokerAdapter:
         except Exception as e:
             logging.error(f"Error disconnecting from IBKR: {str(e)}")
 
-class Broker:
+class _Broker:
     def __init__(self, *, option_multiplier: int, broker_adapter):
         """Initialize the broker with broker adapter only."""
         assert option_multiplier > 0, "option_multiplier must be positive"

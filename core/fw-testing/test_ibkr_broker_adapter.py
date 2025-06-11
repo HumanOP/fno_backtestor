@@ -2,14 +2,14 @@
 import asyncio
 import logging
 import pandas as pd
-from ibkr_broker_adapter import BrokerAdapter, Broker
+from ibkr_broker_adapter import IBKRBrokerAdapter, _Broker
 
 async def main():
     # Configure logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
     # Initialize BrokerAdapter and connect
-    adapter = BrokerAdapter(host='localhost', port=7497, client_id=1)
+    adapter = IBKRBrokerAdapter(host='localhost', port=7497, client_id=1)
     connected = await adapter.connect()
     if not connected:
         logging.error("Failed to connect to IBKR via BrokerAdapter")
@@ -18,7 +18,7 @@ async def main():
     await asyncio.sleep(1.0)  # Wait for connection to stabilize
 
     # Initialize Broker and account
-    broker = Broker(option_multiplier=1, broker_adapter=adapter)
+    broker = _Broker(option_multiplier=1, broker_adapter=adapter)
     await broker.initialize_account()  # Asynchronously initialize account info
 
     # --- Account Summary Section ---
