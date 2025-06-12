@@ -2,7 +2,7 @@ import sys
 import os
 # Add the parent directory to the Python path to allow imports from core
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+print(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.backtesting_opt1 import _Data, Strategy, Backtest
 import pandas as pd
 import math
@@ -173,7 +173,7 @@ from core.backtesting_opt1 import Backtest
 import pandas as pd
 
 if __name__ == "__main__":
-    db_path = "../core/nifty_1min_desiquant.duckdb"
+    db_path = r"FnO-Synapse\demos\nifty_1min_desiquant.duckdb"
     hyperparameter_grid = {
         "upper_gamma": [0.15, 0.18],
         "upper_buffer": [0.05],
@@ -210,32 +210,36 @@ if __name__ == "__main__":
     )
     
     
-    stats = bt.run(iv_slope_thresholds=params, legs=legs)
+    #stats = bt.run(iv_slope_thresholds=params, legs=legs)
+    #bt.tear_sheet()
     
-    print(stats)
+    #print(stats)
     
 
     
-    # result = bt.run_window(start_date="2022-01-01", end_date="2022-04-30", iv_slope_thresholds=params, legs=legs)
-    # hp = HyperParameterOptimizer(
-    #     db_path=db_path,
-    #     strategy=IV_Slope,
-    #     cash=10000000,
-    #     commission_per_contract=0.65,
-    #     option_multiplier=75,
-    #     legs=legs
-    # )
+    result = bt.run_window(start_date="2021-01-01", end_date="2024-01-01", iv_slope_thresholds=params, legs=legs)
+    bt.tear_sheet()
+    print(result)
+
+    """hp = HyperParameterOptimizer(
+         db_path=db_path,
+         strategy=IV_Slope,
+         cash=10000000,
+         commission_per_contract=0.65,
+         option_multiplier=75,
+         legs=legs
+     )
 
 
-    # best_params, best_sharpe, results_df = hp.optimize(
-    #     hyperparameter_grid=hyperparameter_grid,
-    #     maximize='Sharpe Ratio',
-    #     method='grid',
-    #     start_date="2022-01-01",
-    #     end_date="2022-04-30"
-    # )
+    best_params, best_sharpe, results_df = hp.optimize(
+         hyperparameter_grid=hyperparameter_grid,
+         maximize='Sharpe Ratio',
+         method='grid',
+         start_date="2022-01-01",
+         end_date="2023-04-30"
+     )
 
-    # print(f"Best Parameters: {best_params}")
-    # print(f"Best Sharpe Ratio: {best_sharpe}")
-    # print("Results:")
-    # print(results_df)
+    print(f"Best Parameters: {best_params}")
+    print(f"Best Sharpe Ratio: {best_sharpe}")
+    print("Results:")
+    print(results_df)"""
