@@ -101,7 +101,15 @@ class _Data:
         return subset_df.loc[asof_time]
 
     def close(self):
-        self._conn.close()
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def get_spot_prices(self, start_date: str, end_date: str) -> Optional[pd.Series]:
         """
@@ -1135,19 +1143,17 @@ class Backtest:
             # Create a simple benchmark (buy and hold) or use None
             # For now, we'll create a benchmark by loading data again (could be optimized)
             try:
-                data = _Data(self.db_path)
-                # Sample some data to create a benchmark
-                sample_tables = data._table_names[90:203]  # Use same range as in run method
-                daily_benchmark_data = []
-                
-                for table in sample_tables:
-                    data.load_table(table)
-                    if data._spot_table is not None and not data._spot_table.empty:
-                        # Convert minute-level data to daily by resampling
-                        daily_spot = data._spot_table['spot_price'].resample('1D').last()
-                        daily_benchmark_data.append(daily_spot)
-                
-                data.close()
+                with _Data(self.db_path) as data:
+                    # Sample some data to create a benchmark
+                    sample_tables = data._table_names[90:203]  # Use same range as in run method
+                    daily_benchmark_data = []
+                    
+                    for table in sample_tables:
+                        data.load_table(table)
+                        if data._spot_table is not None and not data._spot_table.empty:
+                            # Convert minute-level data to daily by resampling
+                            daily_spot = data._spot_table['spot_price'].resample('1D').last()
+                            daily_benchmark_data.append(daily_spot)
                 
                 if daily_benchmark_data:
                     # Concatenate all daily data

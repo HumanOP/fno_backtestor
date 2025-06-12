@@ -484,9 +484,8 @@ class WalkForwardOptimizer:
                 print(f"   Benchmark date range: {start_date} to {end_date}")
                 
                 # Use the new method to get spot prices for the duration
-                data = _Data(self.duckdb)
-                spot_data = data.get_spot_prices(start_date, end_date)
-                data.close()
+                with _Data(self.duckdb) as data:
+                    spot_data = data.get_spot_prices(start_date, end_date)
                 
                 if spot_data is not None and not spot_data.empty:
                     print(f"   Retrieved spot data: {len(spot_data)} data points")
