@@ -9,8 +9,15 @@ import itertools
 import datetime
 from openpyxl.drawing.image import Image
 import json
+<<<<<<< Updated upstream
 from functools import partial
 from backtesting_opt1 import Backtest
+=======
+from functools import partial, lru_cache
+from core.backtesting_opt1 import Backtest
+from typing import Union, Tuple, Callable
+from tqdm import tqdm as _tqdm
+>>>>>>> Stashed changes
 
 class HyperParameterOptimizer:
     def __init__(self, db_path: str, strategy, *, cash: float = 100000, commission_per_contract: float = 0.65, 
@@ -68,18 +75,27 @@ class HyperParameterOptimizer:
         for idx, flat_params in enumerate(param_combinations, 1):
             print(f"Testing parameters {idx}/{len(param_combinations)}: {flat_params}")
 
-            # Construct the full parameter dictionary
+            # Construct the full parameter dictionary dynamically
+            iv_slope_thresholds = {}
+            other_params = {}
+            
+            for key, value in flat_params.items():
+                if "threshold" in key:
+                    iv_slope_thresholds[key] = value
+                else:
+                    other_params[key] = value
+            
             params = {
-                "iv_slope_thresholds": {
-                    "upper_gamma": flat_params["upper_gamma"],
-                    "upper_buffer": flat_params["upper_buffer"],
-                    "lower_buffer": flat_params["lower_buffer"],
-                    "lower_gamma": flat_params["lower_gamma"]
-                },
-                "portfolio_sl": flat_params.get("portfolio_sl", 0.01),  # Default if not optimized
-                "portfolio_tp": flat_params.get("portfolio_tp", 0.03),  # Default if not optimized
+                "iv_slope_thresholds": iv_slope_thresholds,
+                "portfolio_sl": other_params.get("portfolio_sl", 0.01),  # Default if not optimized
+                "portfolio_tp": other_params.get("portfolio_tp", 0.03),  # Default if not optimized
                 "legs": self.legs  # Pass legs as a parameter
             }
+            
+            # Add any other non-special parameters to the top level
+            for key, value in other_params.items():
+                if key not in ["portfolio_sl", "portfolio_tp"]:
+                    params[key] = value
 
             try:
                 backtest = self._backtest_factory()
@@ -134,6 +150,201 @@ class HyperParameterOptimizer:
 
         return best_params, best_sharpe, results_df
 
+<<<<<<< Updated upstream
+=======
+    def _optimize_sambo(self, hyperparameter_grid: dict, maximize: str, start_date: str, end_date: str,
+                       max_tries: int, constraint: callable, random_state: int, 
+                       return_heatmap: bool, return_optimization: bool):
+        """SAMBO (Bayesian) optimization implementation"""
+        try:
+            import sambo
+        except ImportError:
+            raise ImportError("Need package 'sambo' for method='sambo'. Install with: pip install sambo") from None
+
+        # Set default max_tries for SAMBO
+        if max_tries is None:
+            max_tries = 10
+        elif 0 < max_tries <= 1:
+            # If max_tries is a fraction, convert to absolute number
+            grid_size = np.prod([len(values) for values in hyperparameter_grid.values()])
+            max_tries = max(1, int(max_tries * grid_size))
+        
+        print(f"SAMBO optimization with {max_tries} iterations")
+
+        # Convert hyperparameter grid to SAMBO dimensions
+        dimensions = []
+        param_names = list(hyperparameter_grid.keys())
+        
+        for key, values in hyperparameter_grid.items():
+            values = np.asarray(values)
+            
+            # Handle different data types
+            if values.dtype.kind in 'mM':  # timedelta, datetime64
+                # Convert to int64 for SAMBO compatibility
+                values = values.astype(np.int64)
+
+            if values.dtype.kind in 'iumM':  # integer types
+                dimensions.append((values.min(), values.max() + 1))
+            elif values.dtype.kind == 'f':  # float types
+                dimensions.append((values.min(), values.max()))
+            else:  # categorical
+                dimensions.append(values.tolist())
+
+        print(f"Parameter dimensions: {dimensions}")
+
+        # Counter for tracking evaluations
+        eval_count = [0]  # Use list to make it mutable in nested function
+        
+        # Memoized run function to avoid recomputing same parameters
+        @lru_cache()
+        def memoized_run(param_tuple):
+            flat_params = dict(param_tuple)
+            
+            # Construct the full parameter dictionary dynamically
+            iv_slope_thresholds = {}
+            other_params = {}
+            
+            for key, value in flat_params.items():
+                if "threshold" in key:
+                    iv_slope_thresholds[key] = value
+                else:
+                    other_params[key] = value
+            
+            params = {
+                "iv_slope_thresholds": iv_slope_thresholds,
+                "portfolio_sl": other_params.get("portfolio_sl", 0.01),
+                "portfolio_tp": other_params.get("portfolio_tp", 0.03),
+                "legs": self.legs
+            }
+            
+            # Add any other non-special parameters to the top level
+            for key, value in other_params.items():
+                if key not in ["portfolio_sl", "portfolio_tp"]:
+                    params[key] = value
+            
+            try:
+                backtest = self._backtest_factory()
+                
+                if start_date is not None or end_date is not None:
+                    result = backtest.run_window(start_date=start_date, end_date=end_date, **params)
+                else:
+                    result = backtest.run(**params)
+                
+                if maximize not in result or pd.isna(result[maximize]):
+                    print(f"Invalid result for params {flat_params}: {result}")
+                    return 1000.0  # Return large penalty for invalid results
+                
+                # Return negative value since SAMBO minimizes but we want to maximize
+                return -float(result[maximize])
+                
+            except Exception as e:
+                print(f"Error in backtest with params {flat_params}: {e}")
+                return 1000.0  # Return large penalty for failed backtests
+
+        def objective_function(x):
+            eval_count[0] += 1
+            if eval_count[0] % 10 == 0:
+                print(f"Evaluation {eval_count[0]}/{max_tries}")
+            
+            param_dict = dict(zip(param_names, x))
+            param_tuple = tuple(param_dict.items())
+            
+            try:
+                value = memoized_run(param_tuple)
+                # Ensure we return a finite number
+                if np.isnan(value) or np.isinf(value):
+                    return 1000.0
+                return float(value)
+            except Exception as e:
+                print(f"Error in objective function: {e}")
+                return 1000.0
+
+        # Simplified constraints function
+        constraints = None
+        if constraint is not None:
+            def cons(x):
+                try:
+                    param_dict = dict(zip(param_names, x))
+                    return constraint(param_dict)
+                except Exception as e:
+                    print(f"Error in constraint function: {e}")
+                    return False
+            constraints = cons
+
+        try:
+            print("Starting SAMBO optimization...")
+            # Run SAMBO optimization
+            res = sambo.minimize(
+                fun=objective_function,
+                bounds=dimensions,
+                constraints=constraints,
+                max_iter=max_tries,
+                method='sceua',  # Shuffled Complex Evolution
+                rng=random_state
+            )
+            print("SAMBO optimization completed.")
+        
+        except Exception as e:
+            print(f"Error during SAMBO optimization: {e}")
+            # Return best grid search result as fallback
+            print("Falling back to grid search...")
+            return self._optimize_grid(hyperparameter_grid, maximize, start_date, end_date, max_tries, constraint)
+
+        # Get the best parameters and reconstruct full parameter dict dynamically
+        best_flat_params = dict(zip(param_names, res.x))
+        
+        iv_slope_thresholds = {}
+        other_params = {}
+        
+        for key, value in best_flat_params.items():
+            if "threshold" in key:
+                iv_slope_thresholds[key] = value
+            else:
+                other_params[key] = value
+        
+        best_params = {
+            "iv_slope_thresholds": iv_slope_thresholds,
+            "portfolio_sl": other_params.get("portfolio_sl", 0.01),
+            "portfolio_tp": other_params.get("portfolio_tp", 0.03),
+            "legs": self.legs
+        }
+        
+        # Add any other non-special parameters to the top level
+        for key, value in other_params.items():
+            if key not in ["portfolio_sl", "portfolio_tp"]:
+                best_params[key] = value
+
+        # Get the best score (convert back from negative)
+        best_score = -res.fun
+        
+        print(f"\n=== SAMBO Optimization Complete ===")
+        print(f"Total evaluations: {eval_count[0]}")
+        print(f"Best {maximize}: {best_score:.4f}")
+        print(f"Best parameters: {best_params}")
+
+        # Prepare output
+        # output = [best_params, best_score]
+
+        # if return_heatmap:
+        #     # Create heatmap from optimization history
+        #     try:
+        #         heatmap = pd.Series(dict(zip(map(tuple, res.xv), -res.funv)),
+        #                           name=maximize)
+        #         heatmap.index.names = param_names
+        #         heatmap.sort_index(inplace=True)
+        #         output.append(heatmap)
+        #     except Exception as e:
+        #         print(f"Could not create heatmap: {e}")
+        #         output.append(None)
+
+        # if return_optimization:
+        #     output.append(res)
+            
+        return best_params, best_score
+
+        # return tuple(output) if len(output) > 2 else (best_params, best_score)
+
+>>>>>>> Stashed changes
     def generate_heatmaps(self, results_df: 'pd.DataFrame', output_file: str, png_directory: str) -> None:
         workbook = Workbook()
         sheet = workbook.create_sheet(title="Sharpe Ratio")
