@@ -4,20 +4,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 from openpyxl import Workbook
-from itertools import product
+from itertools import product, repeat
 import itertools
 import datetime
 from openpyxl.drawing.image import Image
 import json
-<<<<<<< Updated upstream
 from functools import partial
 from backtesting_opt1 import Backtest
-=======
 from functools import partial, lru_cache
 from core.backtesting_opt1 import Backtest
 from typing import Union, Tuple, Callable
 from tqdm import tqdm as _tqdm
->>>>>>> Stashed changes
+from functools import partial, lru_cache
+from backtesting_opt1 import Backtest
+from typing import Union, Tuple, Callable
+from tqdm import tqdm as _tqdm
 
 class HyperParameterOptimizer:
     def __init__(self, db_path: str, strategy, *, cash: float = 100000, commission_per_contract: float = 0.65, 
@@ -30,32 +31,46 @@ class HyperParameterOptimizer:
 
     def optimize(self, hyperparameter_grid: dict, maximize: str = 'Sharpe Ratio', 
                  method: str = 'grid', start_date: str = None, end_date: str = None,
-                 max_tries: int = None, constraint: callable = None):
+                 max_tries: int = None, constraint: callable = None, random_state: int = None,
+                 return_heatmap: bool = False, return_optimization: bool = False):
         """
-        Optimize hyperparameters using grid search.
+        Optimize hyperparameters using grid search or SAMBO (Bayesian optimization).
         
         Parameters:
         - hyperparameter_grid: dict, parameter combinations to test
         - maximize: str, metric to maximize (default: 'Sharpe Ratio')
-        - method: str, optimization method (only 'grid' supported)
+        - method: str, optimization method ('grid' or 'sambo')
         - max_tries: int, maximum parameter combinations to test
         - constraint: callable, function to filter parameter combinations
         - start_date: str, start date for backtest window (YYYY-MM-DD format)
         - end_date: str, end date for backtest window (YYYY-MM-DD format)
+        - random_state: int, random seed for reproducible results (SAMBO only)
+        - return_heatmap: bool, whether to return optimization heatmap (SAMBO only)
+        - return_optimization: bool, whether to return optimization object (SAMBO only)
         
         Returns:
         - best_params: dict, best parameter combination
         - best_score: float, best metric value
-        - results_df: pd.DataFrame, all results
+        - results_df: pd.DataFrame, all results (grid search only)
         """
-        if method != 'grid':
-            raise ValueError("Only 'grid' method is supported in this implementation")
+        if method not in ['grid', 'sambo']:
+            raise ValueError(f"Method should be 'grid' or 'sambo', not {method!r}")
             
         # Log the optimization window if specified
         if start_date or end_date:
             print(f"Optimizing on date window: {start_date} to {end_date}")
         else:
             print("Optimizing on full dataset")
+
+        if method == 'grid':
+            return self._optimize_grid(hyperparameter_grid, maximize, start_date, end_date, max_tries, constraint)
+        elif method == 'sambo':
+            return self._optimize_sambo(hyperparameter_grid, maximize, start_date, end_date, max_tries, constraint, 
+                                      random_state, return_heatmap, return_optimization)
+
+    def _optimize_grid(self, hyperparameter_grid: dict, maximize: str, start_date: str, end_date: str, 
+                      max_tries: int, constraint: callable):
+        """Original grid search implementation"""
         param_keys = list(hyperparameter_grid.keys())
         param_values = [hyperparameter_grid[key] for key in param_keys]
         param_combinations = [dict(zip(param_keys, combo)) for combo in product(*param_values)]
@@ -140,18 +155,9 @@ class HyperParameterOptimizer:
                 print(f"Average {maximize}: {results_df['Sharpe Ratio'].mean():.4f}")
         else:
             print("Warning: No valid results found during optimization")
-        
-        # timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        # output_directory_path = os.path.join(os.getcwd(), f'hyperparameter_optimizer_output_{timestamp}')
-        # os.makedirs(output_directory_path, exist_ok=True)
-        # sheet_path = os.path.join(output_directory_path, 'summary.xlsx')
-        # self.generate_heatmaps(results_df, sheet_path, output_directory_path)
-        # self.delete_png_files(output_directory_path)
 
         return best_params, best_sharpe, results_df
 
-<<<<<<< Updated upstream
-=======
     def _optimize_sambo(self, hyperparameter_grid: dict, maximize: str, start_date: str, end_date: str,
                        max_tries: int, constraint: callable, random_state: int, 
                        return_heatmap: bool, return_optimization: bool):
@@ -221,6 +227,19 @@ class HyperParameterOptimizer:
             for key, value in other_params.items():
                 if key not in ["portfolio_sl", "portfolio_tp"]:
                     params[key] = value
+            
+            # Construct the full parameter dictionary
+            params = {
+                "iv_slope_thresholds": {
+                    "upper_gamma": flat_params["upper_gamma"],
+                    "upper_buffer": flat_params["upper_buffer"],
+                    "lower_buffer": flat_params["lower_buffer"],
+                    "lower_gamma": flat_params["lower_gamma"]
+                },
+                "portfolio_sl": flat_params.get("portfolio_sl", 0.01),
+                "portfolio_tp": flat_params.get("portfolio_tp", 0.03),
+                "legs": self.legs
+            }
             
             try:
                 backtest = self._backtest_factory()
@@ -313,6 +332,19 @@ class HyperParameterOptimizer:
         for key, value in other_params.items():
             if key not in ["portfolio_sl", "portfolio_tp"]:
                 best_params[key] = value
+        # Get the best parameters and reconstruct full parameter dict
+        best_flat_params = dict(zip(param_names, res.x))
+        best_params = {
+            "iv_slope_thresholds": {
+                "upper_gamma": best_flat_params["upper_gamma"],
+                "upper_buffer": best_flat_params["upper_buffer"],
+                "lower_buffer": best_flat_params["lower_buffer"],
+                "lower_gamma": best_flat_params["lower_gamma"]
+            },
+            "portfolio_sl": best_flat_params.get("portfolio_sl", 0.01),
+            "portfolio_tp": best_flat_params.get("portfolio_tp", 0.03),
+            "legs": self.legs
+        }
 
         # Get the best score (convert back from negative)
         best_score = -res.fun
@@ -344,7 +376,6 @@ class HyperParameterOptimizer:
 
         # return tuple(output) if len(output) > 2 else (best_params, best_score)
 
->>>>>>> Stashed changes
     def generate_heatmaps(self, results_df: 'pd.DataFrame', output_file: str, png_directory: str) -> None:
         workbook = Workbook()
         sheet = workbook.create_sheet(title="Sharpe Ratio")

@@ -90,7 +90,6 @@ class WalkForwardOptimizer:
         out_sample_performances = []
         
         # Collect all out-sample data for consolidated tearsheet
-        all_out_sample_equity_curves = []
         all_out_sample_trades = []
         out_sample_periods = []
         
@@ -227,21 +226,15 @@ class WalkForwardOptimizer:
             results.append(window_result)
             out_sample_performances.append(out_sample_performance)
             
-            # Collect out-sample data for consolidated tearsheet
+            # Collect only out-sample trades for consolidated tearsheet
             if out_sample_results is not None:
-                # Extract equity curve and trades from out-sample results
-                equity_curve = out_sample_results.get('_equity_curve')
+                # Extract only trades from out-sample results
                 trades_data = out_sample_results.get('_trades')
-                
-                if equity_curve is not None and not equity_curve.empty:
-                    all_out_sample_equity_curves.append(equity_curve)
                 
                 if trades_data is not None and not trades_data.empty:
                     all_out_sample_trades.append(trades_data)
-                
-                out_sample_periods.append((out_sample_start, out_sample_end))
-                
-                print(f" Collected out-sample data: {len(equity_curve)} equity points, {len(trades_data)} trades")
+                    out_sample_periods.append((out_sample_start, out_sample_end))
+                    print(f" Collected out-sample data: {len(trades_data)} trades")
             
             print(f"Window {window_idx + 1}/{len(self.windows)} completed successfully!")
             print(f"   Remaining windows: {len(self.windows) - (window_idx + 1)}")
@@ -285,12 +278,11 @@ class WalkForwardOptimizer:
         print(f"Best parameters: {best_params}")
         
         # Generate consolidated tearsheet from all out-sample periods
-        if all_out_sample_equity_curves and all_out_sample_trades:
+        if all_out_sample_trades:
             print("\n" + "="*70)
             print(" GENERATING OUT-SAMPLE TEARSHEET")
             print("="*70)
             self._generate_tearsheet(
-                all_out_sample_equity_curves,
                 all_out_sample_trades,
                 out_sample_periods,
                 best_params,
@@ -378,14 +370,55 @@ class WalkForwardOptimizer:
         print(f"\n Walk-Forward Optimization completed successfully!")
         return best_params, avg_out_sample_performance, results
 
-    def _generate_tearsheet(self, all_out_sample_equity_curves, all_out_sample_trades, out_sample_periods, 
-                                         best_params, avg_out_sample_performance, results):
+    def _calculate_equity_curve_from_trades(self, trades_df: pd.DataFrame, initial_cash: float) -> pd.DataFrame:
+        """
+        Calculate equity curve from trades DataFrame.
+        
+        Parameters:
+        - trades_df: DataFrame with columns ['EntryTime', 'ExitTime', 'PnL', 'ReturnPct', 'EntryTag', 'ExitTag', 'Duration']
+        - initial_cash: Starting cash amount
+        
+        Returns:
+        - DataFrame with equity curve indexed by datetime
+        """
+        if trades_df.empty:
+            return pd.DataFrame({'Equity': [initial_cash]}, index=[pd.Timestamp.now()])
+        
+        # Sort trades by exit time (when PnL is realized)
+        trades_sorted = trades_df.sort_values('ExitTime').copy()
+        
+        # Create a series of PnL indexed by exit time
+        pnl_series = pd.Series(trades_sorted['PnL'].values, index=pd.to_datetime(trades_sorted['ExitTime']))
+        
+        # Calculate cumulative PnL and add initial cash
+        cumulative_pnl = pnl_series.cumsum()
+        equity_curve = initial_cash + cumulative_pnl
+        
+        # Create DataFrame with proper column name
+        equity_df = pd.DataFrame({'Equity': equity_curve})
+        
+        # Add initial point at the start
+        if not equity_df.empty:
+            start_time = pd.to_datetime(trades_sorted['EntryTime'].iloc[0])
+            if start_time not in equity_df.index:
+                initial_point = pd.DataFrame({'Equity': [initial_cash]}, index=[start_time])
+                equity_df = pd.concat([initial_point, equity_df]).sort_index()
+        
+        # Remove any duplicate timestamps
+        equity_df = equity_df[~equity_df.index.duplicated(keep='last')]
+        
+        print(f"   Calculated equity curve: {len(equity_df)} points")
+        print(f"   Equity range: {equity_df['Equity'].min():.2f} to {equity_df['Equity'].max():.2f}")
+        print(f"   Date range: {equity_df.index.min()} to {equity_df.index.max()}")
+        
+        return equity_df
+
+    def _generate_tearsheet(self, all_out_sample_trades, out_sample_periods, best_params, avg_out_sample_performance, results):
         """
         Generate a tearsheet from all out-sample periods by concatenating 
         equity curves and trades, then using existing tearsheet functionality.
         
         Parameters:
-        - all_out_sample_equity_curves: List of equity curves from out-sample periods
         - all_out_sample_trades: List of trades from out-sample periods  
         - out_sample_periods: List of out-sample periods
         - best_params: Best parameters from WFO
@@ -393,23 +426,6 @@ class WalkForwardOptimizer:
         - results: List of all window results
         """
         try:
-            print(" Concatenating equity curves from all out-sample periods...")
-            print(f"   Number of equity curves to concatenate: {len(all_out_sample_equity_curves)}")
-            
-            # Debug: Check the structure of equity curves
-            for i, eq_curve in enumerate(all_out_sample_equity_curves):
-                print(f"   Equity curve {i+1}: {type(eq_curve)}, shape: {eq_curve.shape if hasattr(eq_curve, 'shape') else 'N/A'}")
-                print(f"      Columns: {eq_curve.columns.tolist() if hasattr(eq_curve, 'columns') else 'N/A'}")
-            
-            # Concatenate all equity curves
-            consolidated_equity_curve = pd.concat(all_out_sample_equity_curves, ignore_index=False)
-            consolidated_equity_curve = consolidated_equity_curve.sort_index()
-            
-            # Handle duplicate timestamps by taking the last value (in case of overlaps)
-            if consolidated_equity_curve.index.duplicated().any():
-                print(" Found duplicate timestamps, taking last values...")
-                consolidated_equity_curve = consolidated_equity_curve.groupby(consolidated_equity_curve.index).last()
-            
             print(" Concatenating trades from all out-sample periods...")
             print(f"   Number of trade DataFrames to concatenate: {len(all_out_sample_trades)}")
             
@@ -426,6 +442,13 @@ class WalkForwardOptimizer:
                 consolidated_trades = consolidated_trades.sort_values('EntryTime')
             elif 'EntryBar' in consolidated_trades.columns:
                 consolidated_trades = consolidated_trades.sort_values('EntryBar')
+            
+            print(f"   Consolidated trades: {len(consolidated_trades)} total trades")
+            print(f"   Trade columns: {consolidated_trades.columns.tolist()}")
+            
+            # Calculate equity curve from consolidated trades
+            print(" Calculating equity curve from consolidated trades...")
+            consolidated_equity_curve = self._calculate_equity_curve_from_trades(consolidated_trades, self.cash)
             
             # Create consolidated results object matching the format expected by tearsheet
             print(" Computing consolidated statistics...")
@@ -447,12 +470,21 @@ class WalkForwardOptimizer:
                 consolidated_results = pd.Series({
                     '_equity_curve': consolidated_equity_curve,
                     '_trades': consolidated_trades,
-                    'Sharpe Ratio': 0.0,  # Placeholder
+                    'Sharpe Ratio': 0.0,  # Placeholder - will be calculated from equity curve
                     'Total Trades': len(consolidated_trades),
                     'Start': consolidated_equity_curve.index.min(),
                     'End': consolidated_equity_curve.index.max()
                 })
-                print(" Created minimal results object")
+                
+                # Calculate basic stats from equity curve
+                if len(consolidated_equity_curve) > 1:
+                    returns = consolidated_equity_curve['Equity'].pct_change().dropna()
+                    if not returns.empty and returns.std() > 0:
+                        sharpe_ratio = returns.mean() / returns.std() * np.sqrt(252)  # Annualized
+                        consolidated_results['Sharpe Ratio'] = sharpe_ratio
+                        print(f"   Calculated Sharpe Ratio: {sharpe_ratio:.4f}")
+                
+                print(" Created minimal results object with calculated equity curve")
             
             # Add WFO-specific metadata
             consolidated_results['WFO_Windows'] = len(results)
