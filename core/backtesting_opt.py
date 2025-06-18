@@ -6,11 +6,43 @@ import warnings
 from abc import ABC, abstractmethod
 from copy import copy
 from datetime import datetime, date as DateObject # Added DateObject
-from functools import partial # lru_cache removed
+from functools import partial, lru_cache
+from itertools import compress, product, repeat
 from math import copysign
 from numbers import Number
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 import webbrowser
+
+import numpy as np
+from numpy.random import default_rng
+from core.stats import compute_stats
+try:
+    # Patch the problematic magic method before importing quantstats
+    try:
+        from IPython import get_ipython
+        ipython = get_ipython()
+        if ipython is not None and not hasattr(ipython, 'magic'):
+            # Add compatibility method for older quantstats versions
+            def magic(line):
+                try:
+                    if line == "matplotlib inline":
+                        ipython.run_line_magic('matplotlib', 'inline')
+                    else:
+                        parts = line.split(' ', 1)
+                        if len(parts) == 2:
+                            ipython.run_line_magic(parts[0], parts[1])
+                        else:
+                            ipython.run_line_magic(parts[0], '')
+                except Exception:
+                    pass  # Silently ignore matplotlib inline errors
+            ipython.magic = magic
+    except ImportError:
+        pass  # Not in IPython/Jupyter environment
+    
+    import quantstats_lumi as quantstats
+except ImportError:
+    quantstats = None
+    warnings.warn("quantstats not installed. tear_sheet method will not work unless quantstats is installed.")
 
 import numpy as np
 import pandas as pd
@@ -795,11 +827,13 @@ class Backtest:
 
     def run(self, **kwargs) -> pd.Series:
         data = _Data(self.db_path)
-        data._table_names = data._table_names[90:703] # For testing, load only a few tables
+        data._table_names = data._table_names[90:203] # For testing, load only a few tables
         broker: _Broker = self._broker_factory(data=data)
         strategy: Strategy = self._strategy(broker, data, kwargs)
         processed_orders: List[Order] = []
         final_positions = None
+        equity_curve = pd.Series(dtype=float)
+        first_trade_bar = 0
 
         try:
             strategy.init()
@@ -828,6 +862,9 @@ class Backtest:
 
                     broker.next()  # This will call _process_orders
                     # print(f"Processed {table} in {time.time() - start:.2f} seconds at {row.Index}")
+                    equity_curve[row.Index.date()] = broker.equity()
+                    if not first_trade_bar and broker.trades:
+                        first_trade_bar = row.Index.date()
 
                 except _OutOfMoneyError:
                     print('Strategy ran out of money.')
@@ -866,8 +903,916 @@ class Backtest:
             data.close()
         
         progress_bar.close()
+        equity_curve = equity_curve.sort_index()
+        
+        stats = compute_stats(
+            orders=processed_orders,
+            trades=broker.closed_trades,
+            equity_curve=equity_curve,
+        )
+        stats['_trade_start_bar'] = first_trade_bar
+        
+        # Store results for tear_sheet method
+        self._results = stats
 
-        return processed_orders, final_positions, broker.closed_trades, broker.orders
+        # return processed_orders, final_positions, broker.closed_trades, broker.orders
+        return stats
+    
+    def optimize(self, *,
+                 maximize: Union[str, Callable[[pd.Series], float]] = 'Sharpe Ratio',
+                 method: str = 'grid',
+                 max_tries: Optional[Union[int, float]] = None,
+                 constraint: Optional[Callable[[dict], bool]] = None,
+                 return_heatmap: bool = False,
+                 return_optimization: bool = False,
+                 random_state: Optional[int] = None,
+                 **kwargs) -> Union[pd.Series,
+                                    Tuple[pd.Series, pd.Series],
+                                    Tuple[pd.Series, pd.Series, dict]]:
+        """
+        Optimize strategy parameters to an optimal combination.
+        Returns result `pd.Series` of the best run.
+
+        `maximize` is a string key from the backtest.run()-returned results series,
+        or a function that accepts this series object and returns a number;
+        the higher the better. By default, the method maximizes
+        'Sharpe Ratio'.
+
+        `method` is the optimization method. Currently three methods are supported:
+
+        * `"grid"` which does an exhaustive (or randomized) search over the
+          cartesian product of parameter combinations,
+        * `"skopt"` which finds close-to-optimal strategy parameters using
+          [model-based optimization], making at most `max_tries` evaluations, and
+        * `"sambo"` which uses Shuffled Complex Evolution algorithm for
+          global optimization, particularly effective for complex parameter spaces.
+
+        [model-based optimization]: \
+            https://scikit-optimize.github.io/stable/auto_examples/bayesian-optimization.html
+
+        `max_tries` is the maximal number of strategy runs to perform.
+        If `method="grid"`, this results in randomized grid search.
+        If `max_tries` is a floating value between (0, 1], this sets the
+        number of runs to approximately that fraction of full grid space.
+        Alternatively, if integer, it denotes the absolute maximum number
+        of evaluations.         If unspecified (default), grid search is exhaustive,
+        whereas for `method="skopt"`, `max_tries` is set to 200,
+        and for `method="sambo"`, `max_tries` is set to 10.
+
+        `constraint` is a function that accepts a dict-like object of
+        parameters (with values) and returns `True` when the combination
+        is admissible to test with. By default, any parameters combination
+        is considered admissible.
+
+        If `return_heatmap` is `True`, besides returning the result
+        series, an additional `pd.Series` is returned with a multiindex
+        of all admissible parameter combinations, which can be further
+        inspected or projected onto 2D to plot a heatmap.
+
+        If `return_optimization` is True and `method = 'skopt'`,
+        in addition to result series (and maybe heatmap), return raw
+        [`scipy.optimize.OptimizeResult`][OptimizeResult] for further
+        inspection, e.g. with [scikit-optimize] plotting tools.
+
+        [OptimizeResult]: \
+            https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.OptimizeResult.html
+        [scikit-optimize]: https://scikit-optimize.github.io
+
+        If you want reproducible optimization results, set `random_state`
+        to a fixed integer random seed.
+
+        Additional keyword arguments represent strategy arguments with
+        list-like collections of possible values. For example, the following
+        code finds and returns the "best" of the 7 admissible (of the
+        9 possible) parameter combinations:
+
+            backtest.optimize(sma1=[5, 10, 15], sma2=[10, 20, 40],
+                              constraint=lambda p: p.sma1 < p.sma2)
+        """
+        if not kwargs:
+            raise ValueError('Need some strategy parameters to optimize')
+
+        maximize_key = None
+        if isinstance(maximize, str):
+            maximize_key = str(maximize)
+            stats = self._results if self._results is not None else self.run()
+            if maximize not in stats:
+                raise ValueError('`maximize`, if str, must match a key in pd.Series '
+                                 'result of backtest.run()')
+
+            def maximize(stats: pd.Series, _key=maximize):
+                return stats[_key]
+
+        elif not callable(maximize):
+            raise TypeError('`maximize` must be str (a field of backtest.run() result '
+                            'Series) or a function that accepts result Series '
+                            'and returns a number; the higher the better')
+        assert callable(maximize), maximize
+
+        have_constraint = bool(constraint)
+        if constraint is None:
+
+            def constraint(_):
+                return True
+
+        elif not callable(constraint):
+            raise TypeError("`constraint` must be a function that accepts a dict "
+                            "of strategy parameters and returns a bool whether "
+                            "the combination of parameters is admissible or not")
+        assert callable(constraint), constraint
+
+        if return_optimization and method not in ['skopt', 'sambo']:
+            raise ValueError("return_optimization=True only valid if method='skopt' or method='sambo'")
+
+        def _tuple(x):
+            return x if isinstance(x, Sequence) and not isinstance(x, str) else (x,)
+
+        for k, v in kwargs.items():
+            if len(_tuple(v)) == 0:
+                raise ValueError(f"Optimization variable '{k}' is passed no "
+                                 f"optimization values: {k}={v}")
+
+        class AttrDict(dict):
+            def __getattr__(self, item):
+                return self[item]
+
+        def _grid_size():
+            size = int(np.prod([len(_tuple(v)) for v in kwargs.values()]))
+            if size < 10_000 and have_constraint:
+                size = sum(1 for p in product(*(zip(repeat(k), _tuple(v))
+                                                for k, v in kwargs.items()))
+                           if constraint(AttrDict(p)))
+            return size
+
+        def _optimize_grid() -> Union[pd.Series, Tuple[pd.Series, pd.Series]]:
+            rand = default_rng(random_state).random
+            grid_frac = (1 if max_tries is None else
+                         max_tries if 0 < max_tries <= 1 else
+                         max_tries / _grid_size())
+            param_combos = [dict(params)
+                            for params in (AttrDict(params)
+                                           for params in product(*(zip(repeat(k), _tuple(v))
+                                                                   for k, v in kwargs.items())))
+                            if constraint(params)  # type: ignore
+                            and rand() <= grid_frac]
+            if not param_combos:
+                raise ValueError('No admissible parameter combinations to test')
+
+            if len(param_combos) > 1000:
+                warnings.warn(f'Searching for best of {len(param_combos)} configurations.',
+                              stacklevel=2)
+
+            heatmap = pd.Series(np.nan,
+                                name=maximize_key,
+                                index=pd.MultiIndex.from_tuples(
+                                    [p.values() for p in param_combos],
+                                    names=next(iter(param_combos)).keys()))
+
+            # Sequential optimization - no multiprocessing
+            print(f"Running optimization on {len(param_combos)} parameter combinations...")
+            for i, params in enumerate(_tqdm(param_combos, desc='Optimizing')):
+                try:
+                    stats = self.run(**params)
+                    value = maximize(stats) 
+                    heatmap[tuple(params.values())] = value
+                    
+                    if i % 10 == 0 or i == len(param_combos) - 1:
+                        print(f"Completed {i+1}/{len(param_combos)} runs")
+                        
+                except Exception as e:
+                    print(f"Error in optimization run {i+1}: {e}")
+                    heatmap[tuple(params.values())] = np.nan
+                    continue
+            
+            # Find best parameters
+            if heatmap.isna().all():
+                # Handle case where all values in the series are NA
+                print("Warning: All optimization runs failed. Using first parameter set.")
+                stats = self.run(**param_combos[0])
+            else:
+                best_params = heatmap.idxmax(skipna=True)
+                print(f"Best parameters found: {dict(zip(heatmap.index.names, best_params))}")
+                print(f"Best score: {heatmap.max()}")
+                stats = self.run(**dict(zip(heatmap.index.names, best_params)))
+
+            if return_heatmap:
+                return stats, heatmap
+            return stats
+
+        def _optimize_skopt() -> Union[pd.Series,
+                                       Tuple[pd.Series, pd.Series],
+                                       Tuple[pd.Series, pd.Series, dict]]:
+            try:
+                from skopt import forest_minimize
+                from skopt.callbacks import DeltaXStopper
+                from skopt.learning import ExtraTreesRegressor
+                from skopt.space import Categorical, Integer, Real
+                from skopt.utils import use_named_args
+            except ImportError:
+                raise ImportError("Need package 'scikit-optimize' for method='skopt'. "
+                                  "pip install scikit-optimize") from None
+
+            nonlocal max_tries
+            max_tries = (200 if max_tries is None else
+                         max(1, int(max_tries * _grid_size())) if 0 < max_tries <= 1 else
+                         max_tries)
+
+            dimensions = []
+            for key, values in kwargs.items():
+                values = np.asarray(values)
+                if values.dtype.kind in 'mM':  # timedelta, datetime64
+                    # these dtypes are unsupported in skopt, so convert to raw int
+                    # TODO: save dtype and convert back later
+                    values = values.astype(int)
+
+                if values.dtype.kind in 'iumM':
+                    dimensions.append(Integer(low=values.min(), high=values.max(), name=key))
+                elif values.dtype.kind == 'f':
+                    dimensions.append(Real(low=values.min(), high=values.max(), name=key))
+                else:
+                    dimensions.append(Categorical(values.tolist(), name=key, transform='onehot'))
+
+            # Avoid recomputing re-evaluations:
+            # "The objective has been evaluated at this point before."
+            # https://github.com/scikit-optimize/scikit-optimize/issues/302
+            memoized_run = lru_cache()(lambda tup: self.run(**dict(tup)))
+
+            # np.inf/np.nan breaks sklearn, np.finfo(float).max breaks skopt.plots.plot_objective
+            INVALID = 1e300
+            progress = iter(_tqdm(repeat(None), total=max_tries, desc='Skopt Optimization'))
+
+            @ use_named_args(dimensions=dimensions)
+            def objective_function(**params):
+                next(progress)
+                # Check constraints
+                # TODO: Adjust after https://github.com/scikit-optimize/scikit-optimize/pull/971
+                if not constraint(AttrDict(params)):
+                    return INVALID
+                res = memoized_run(tuple(params.items()))
+                value = -maximize(res)
+                if np.isnan(value):
+                    return INVALID
+                return value
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore', 'The objective has been evaluated at this point before.')
+
+                res = forest_minimize(
+                    func=objective_function,
+                    dimensions=dimensions,
+                    n_calls=max_tries,
+                    base_estimator=ExtraTreesRegressor(n_estimators=20, min_samples_leaf=2),
+                    acq_func='LCB',
+                    kappa=3,
+                    n_initial_points=min(max_tries, 20 + 3 * len(kwargs)),
+                    initial_point_generator='lhs',  # 'sobel' requires n_initial_points ~ 2**N
+                    callback=DeltaXStopper(9e-7),
+                    random_state=random_state)
+
+            stats = self.run(**dict(zip(kwargs.keys(), res.x)))
+            output = [stats]
+
+            if return_heatmap:
+                heatmap = pd.Series(dict(zip(map(tuple, res.x_iters), -res.func_vals)),
+                                    name=maximize_key)
+                heatmap.index.names = kwargs.keys()
+                heatmap = heatmap[heatmap != -INVALID]
+                heatmap.sort_index(inplace=True)
+                output.append(heatmap)
+
+            if return_optimization:
+                valid = res.func_vals != INVALID
+                res.x_iters = list(compress(res.x_iters, valid))
+                res.func_vals = res.func_vals[valid]
+                output.append(res)
+
+            return stats if len(output) == 1 else tuple(output)
+
+        def _optimize_sambo() -> Union[pd.Series,
+                                       Tuple[pd.Series, pd.Series],
+                                       Tuple[pd.Series, pd.Series, dict]]:
+            try:
+                import sambo
+            except ImportError:
+                raise ImportError("Need package 'sambo' for method='sambo'. pip install sambo") from None
+
+            nonlocal max_tries
+            max_tries = (200 if max_tries is None else
+                         max(1, int(max_tries * _grid_size())) if 0 < max_tries <= 1 else
+                         max_tries)
+
+            dimensions = []
+            for key, values in kwargs.items():
+                values = np.asarray(_tuple(values))
+                if values.dtype.kind in 'mM':  # timedelta, datetime64
+                    # these dtypes are unsupported in SAMBO, so convert to raw int
+                    # TODO: save dtype and convert back later
+                    values = values.astype(np.int64)
+
+                if values.dtype.kind in 'iumM':
+                    dimensions.append((values.min(), values.max() + 1))
+                elif values.dtype.kind == 'f':
+                    dimensions.append((values.min(), values.max()))
+                else:
+                    dimensions.append(values.tolist())
+
+            # Avoid recomputing re-evaluations
+            @lru_cache()
+            def memoized_run(tup):
+                nonlocal maximize, self
+                stats = self.run(**dict(tup))
+                return -maximize(stats)
+
+            progress = iter(_tqdm(repeat(None), total=max_tries, leave=False,
+                                  desc='SAMBO Optimization', mininterval=2))
+            _names = tuple(kwargs.keys())
+
+            def objective_function(x):
+                nonlocal progress, memoized_run, constraint, _names
+                next(progress)
+                # Check constraints first
+                if not constraint(AttrDict(zip(_names, x))):
+                    return 1000.0  # Large penalty for constraint violations
+                value = memoized_run(tuple(zip(_names, x)))
+                return 0 if np.isnan(value) else value
+
+            def cons(x):
+                nonlocal constraint, _names
+                return constraint(AttrDict(zip(_names, x)))
+
+            res = sambo.minimize(
+                fun=objective_function,
+                bounds=dimensions,
+                constraints=cons,
+                max_iter=max_tries,
+                method='sceua',
+                rng=random_state)
+
+            stats = self.run(**dict(zip(kwargs.keys(), res.x)))
+            output = [stats]
+
+            if return_heatmap:
+                heatmap = pd.Series(dict(zip(map(tuple, res.xv), res.funv)),
+                                    name=maximize_key)
+                heatmap.index.names = kwargs.keys()
+                heatmap = -heatmap  # Convert back to maximization values (negate the minimized values)
+                heatmap.sort_index(inplace=True)
+                output.append(heatmap)
+
+            if return_optimization:
+                output.append(res)
+
+            return stats if len(output) == 1 else tuple(output)
+
+        if method == 'grid':
+            output = _optimize_grid()
+        elif method == 'skopt':
+            output = _optimize_skopt()
+        elif method == 'sambo':
+            output = _optimize_sambo()
+        else:
+            raise ValueError(f"Method should be 'grid', 'skopt', or 'sambo', not {method!r}")
+        return output
+
+    
+    def tear_sheet(self, *, results: pd.Series = None, plotting_date=None, filename=None, open_browser=True, output_path=None, generate_trade_logs=True):
+        """
+        Generate a detailed tear sheet report using quantstats.
+        
+        Parameters:
+        - results: pd.Series, the backtest results. If None, uses the last run results.
+        - plotting_date: datetime, start date for plotting data (optional).
+        - filename: str, the file path to save the HTML report. Default is 'tearsheet.html'.
+        - open_browser: bool, whether to open the report in a browser. Default is True.
+        - output_path: str, the directory path to save the HTML report. Default is current directory.
+        - generate_trade_logs: bool, whether to automatically generate detailed trade logs. Default is True.
+        """
+        if quantstats is None:
+            raise ImportError("quantstats is required for tear_sheet. Install it using `pip install quantstats-lumi`.")
+
+        if results is None:
+            if self._results is None:
+                raise RuntimeError('First issue `backtest.run()` to obtain results.')
+            results = self._results
+
+        # Extract equity curve and prepare series for quantstats
+        equity_df = results['_equity_curve']
+        equity_series = equity_df['Equity'].resample('1D').last().pct_change().dropna() #changed to daily
+        
+        # Check if benchmark is already provided in results, otherwise create one
+        benchmark_series = None
+        if '_benchmark' in results and results['_benchmark'] is not None:
+            benchmark_series = results['_benchmark']
+            print(f"Using provided benchmark with {len(benchmark_series)} data points")
+        else:
+            # Create a simple benchmark (buy and hold) or use None
+            # For now, we'll create a benchmark by loading data again (could be optimized)
+            try:
+                data = _Data(self.db_path)  # Create _Data instance without context manager
+                # Sample some data to create a benchmark - use same range as in run method
+                sample_tables = data._table_names[90:203]
+                daily_benchmark_data = []
+                
+                print(f"Creating benchmark from {len(sample_tables)} tables...")
+                
+                for table in sample_tables:
+                    try:
+                        data.load_table(table)
+                        if data._spot_table is not None and not data._spot_table.empty:
+                            # Convert minute-level data to daily by resampling
+                            daily_spot = data._spot_table['spot_price'].resample('1D').last()
+                            daily_benchmark_data.append(daily_spot)
+                    except Exception as table_error:
+                        print(f"Warning: Could not load table {table}: {table_error}")
+                        continue
+                
+                data.close()  # Properly close the connection
+                
+                if daily_benchmark_data:
+                    # Concatenate all daily data
+                    benchmark_series = pd.concat(daily_benchmark_data).sort_index()
+                    # Remove duplicates if any (same dates from different tables)
+                    benchmark_series = benchmark_series[~benchmark_series.index.duplicated(keep='first')]
+                    # Calculate percentage returns for benchmark
+                    benchmark_series = benchmark_series.pct_change().dropna()
+                    benchmark_series = benchmark_series.rename("Benchmark")
+                    
+                    print(f"Created default benchmark with {len(benchmark_series)} data points")
+                    
+                else:
+                    benchmark_series = None
+                    print("No benchmark data available")
+            except Exception as e:
+                print(f"Warning: Could not create benchmark data: {e}")
+                import traceback
+                traceback.print_exc()
+                benchmark_series = None
+        
+        current_dir = os.getcwd()
+        if output_path is None:
+            tear_sheet_path = os.path.join(current_dir, filename if filename else "tearsheet.html")
+        else:
+            tear_sheet_path = os.path.join(output_path, filename if filename else "tearsheet.html")
+
+        if plotting_date is not None:
+            equity_series = equity_series[equity_series.index >= plotting_date]
+            if benchmark_series is not None:
+                benchmark_series = benchmark_series[benchmark_series.index >= plotting_date]
+
+        # Enhanced trade logs - prepare detailed trade data for quantstats
+        trades_df = results['_trades']
+        
+        # Create detailed trade logs with additional information
+        detailed_trade_logs = None
+        transactions_df = None
+        
+        if not trades_df.empty:
+            detailed_trade_logs = trades_df.copy()
+            
+            # Add additional columns for better trade analysis
+            if 'EntryTag' in detailed_trade_logs.columns:
+                detailed_trade_logs['Entry_Reason'] = detailed_trade_logs['EntryTag']
+            if 'ExitTag' in detailed_trade_logs.columns:
+                detailed_trade_logs['Exit_Reason'] = detailed_trade_logs['ExitTag']
+            
+            # Calculate trade duration in days if Duration column exists
+            if 'Duration' in detailed_trade_logs.columns:
+                detailed_trade_logs['Duration_Days'] = detailed_trade_logs['Duration'].dt.days
+            
+            # Calculate win/loss ratios
+            detailed_trade_logs['Win'] = detailed_trade_logs['PnL'] > 0
+            
+            # Add trade sequence numbers
+            detailed_trade_logs['Trade_Number'] = range(1, len(detailed_trade_logs) + 1)
+            
+            # Add trade size classification (if applicable)
+            if 'PnL' in detailed_trade_logs.columns:
+                pnl_abs = detailed_trade_logs['PnL'].abs()
+                detailed_trade_logs['Trade_Size_Category'] = pd.cut(
+                    pnl_abs, 
+                    bins=3, 
+                    labels=['Small', 'Medium', 'Large']
+                )
+            
+            # Format trades for quantstats - ensure proper column names and data types
+            # QuantStats expects specific column names for trade display
+            trades_for_qs = detailed_trade_logs.copy()
+            
+            # Rename columns to match quantstats expectations
+            column_mapping = {
+                'EntryTime': 'entry_date',
+                'ExitTime': 'exit_date', 
+                'PnL': 'pnl',
+                'ReturnPct': 'return_pct',
+                'Duration': 'duration'
+            }
+            
+            # Apply column mapping
+            for old_col, new_col in column_mapping.items():
+                if old_col in trades_for_qs.columns:
+                    trades_for_qs[new_col] = trades_for_qs[old_col]
+            
+            # Ensure dates are properly formatted
+            if 'entry_date' in trades_for_qs.columns:
+                trades_for_qs['entry_date'] = pd.to_datetime(trades_for_qs['entry_date'])
+            if 'exit_date' in trades_for_qs.columns:
+                trades_for_qs['exit_date'] = pd.to_datetime(trades_for_qs['exit_date'])
+            
+            # Create transactions dataframe in the format quantstats expects
+            # This helps with displaying individual transactions
+            transactions_list = []
+            for _, trade in trades_for_qs.iterrows():
+                # Entry transaction
+                if 'entry_date' in trade and pd.notna(trade['entry_date']):
+                    transactions_list.append({
+                        'date': trade['entry_date'],
+                        'symbol': getattr(trade, 'Ticker', 'TRADE'),
+                        'qty': abs(getattr(trade, 'Size', 1)),
+                        'price': getattr(trade, 'EntryPrice', 0),
+                        'side': 'BUY' if getattr(trade, 'Size', 1) > 0 else 'SELL',
+                        'trade_num': trade.get('Trade_Number', 0)
+                    })
+                
+                # Exit transaction
+                if 'exit_date' in trade and pd.notna(trade['exit_date']):
+                    transactions_list.append({
+                        'date': trade['exit_date'],
+                        'symbol': getattr(trade, 'Ticker', 'TRADE'),
+                        'qty': abs(getattr(trade, 'Size', 1)),
+                        'price': getattr(trade, 'ExitPrice', 0),
+                        'side': 'SELL' if getattr(trade, 'Size', 1) > 0 else 'BUY',
+                        'trade_num': trade.get('Trade_Number', 0)
+                    })
+            
+            if transactions_list:
+                transactions_df = pd.DataFrame(transactions_list)
+                transactions_df['date'] = pd.to_datetime(transactions_df['date'])
+                transactions_df = transactions_df.sort_values('date')
+            
+            detailed_trade_logs = trades_for_qs
+
+        # Prepare additional parameters for quantstats
+        # Create a summary of orders/transactions for the period
+        additional_stats = {}
+        if results is not None:
+            # Add strategy information
+            additional_stats['Strategy_Name'] = getattr(results.get('_strategy'), '__class__.__name__', 'Unknown')
+            additional_stats['Total_Trades'] = len(trades_df) if not trades_df.empty else 0
+            additional_stats['Winning_Trades'] = len(trades_df[trades_df['PnL'] > 0]) if not trades_df.empty else 0
+            additional_stats['Losing_Trades'] = len(trades_df[trades_df['PnL'] <= 0]) if not trades_df.empty else 0
+            
+            if len(trades_df) > 0:
+                additional_stats['Win_Rate'] = (additional_stats['Winning_Trades'] / additional_stats['Total_Trades']) * 100
+                additional_stats['Average_Trade_PnL'] = trades_df['PnL'].mean()
+                additional_stats['Best_Trade'] = trades_df['PnL'].max()
+                additional_stats['Worst_Trade'] = trades_df['PnL'].min()
+
+        # Create a custom HTML section for trades if quantstats doesn't display them properly
+        trade_log_html = ""
+        if detailed_trade_logs is not None and not detailed_trade_logs.empty:
+            # Generate HTML table for trade logs
+            trade_log_html = self._create_trade_log_html(detailed_trade_logs)
+
+        # Final validation of benchmark before passing to quantstats
+        if benchmark_series is not None and len(benchmark_series) == 0:
+            print("Warning: Benchmark series is empty, setting to None")
+            benchmark_series = None
+        
+        print(f"Generating tearsheet with benchmark: {'Yes' if benchmark_series is not None else 'No'}")
+        if benchmark_series is not None:
+            print(f"Final benchmark series: {len(benchmark_series)} points from {benchmark_series.index.min()} to {benchmark_series.index.max()}")
+        
+        quantstats.reports.html(
+            equity_series,
+            benchmark=benchmark_series,
+            output=tear_sheet_path,
+            title=f"Strategy Tearsheet - {additional_stats.get('Strategy_Name', 'Unknown')}",
+            trades=detailed_trade_logs if detailed_trade_logs is not None else None,
+            transactions=transactions_df if transactions_df is not None else None,
+        )
+        
+        # If quantstats doesn't show trade logs properly, append them to the HTML
+        if trade_log_html and os.path.exists(tear_sheet_path):
+            self._append_trade_logs_to_html(tear_sheet_path, trade_log_html, additional_stats)
+
+        print(f"Trade logs include: {', '.join(detailed_trade_logs.columns.tolist()) if detailed_trade_logs is not None else 'No trade logs to display'}")
+        
+        # Generate detailed trade logs if requested
+        if generate_trade_logs and detailed_trade_logs is not None and not detailed_trade_logs.empty:
+            print("\nGenerating detailed trade logs...")
+            try:
+                log_files = self.generate_trade_logs(results=results, output_path=output_path, file_format='both')
+                if log_files:
+                    print(f"Trade logs generated successfully: {log_files}")
+            except Exception as e:
+                print(f"Warning: Could not generate trade logs: {e}")
+        
+        if open_browser:
+            webbrowser.open(f'file://{tear_sheet_path}')
+
+    def _create_trade_log_html(self, trades_df):
+        """Create HTML table for trade logs."""
+        if trades_df.empty:
+            return ""
+        
+        # Select key columns for display
+        display_columns = []
+        preferred_columns = [
+            'Trade_Number', 'entry_date', 'exit_date', 'Ticker', 'Size', 
+            'EntryPrice', 'ExitPrice', 'pnl', 'return_pct', 'Duration_Days',
+            'Win', 'Entry_Reason', 'Exit_Reason'
+        ]
+        
+        for col in preferred_columns:
+            if col in trades_df.columns:
+                display_columns.append(col)
+        
+        # Use available columns if preferred ones don't exist
+        if not display_columns:
+            display_columns = trades_df.columns.tolist()[:10]  # Limit to first 10 columns
+        
+        trades_display = trades_df[display_columns].copy()
+        
+        # Format the data for better display
+        for col in trades_display.columns:
+            if 'date' in col.lower() and trades_display[col].dtype == 'datetime64[ns]':
+                trades_display[col] = trades_display[col].dt.strftime('%Y-%m-%d %H:%M')
+            elif 'price' in col.lower() or 'pnl' in col.lower():
+                if trades_display[col].dtype in ['float64', 'float32']:
+                    trades_display[col] = trades_display[col].round(2)
+        
+        # Generate HTML table
+        html = f"""
+        <div class="trade-logs-section" style="margin-top: 30px;">
+            <h2 style="color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px;">
+                📋 Detailed Trade Logs
+            </h2>
+            <div style="overflow-x: auto; margin-top: 20px;">
+                {trades_display.to_html(classes='trade-logs-table', table_id='tradeLogsTable', escape=False)}
+            </div>
+        </div>
+        <style>
+        .trade-logs-table {{
+            border-collapse: collapse;
+            width: 100%;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+        }}
+        .trade-logs-table th {{
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            border: 1px solid #ddd;
+        }}
+        .trade-logs-table td {{
+            padding: 8px;
+            border: 1px solid #ddd;
+            text-align: left;
+        }}
+        .trade-logs-table tr:nth-child(even) {{
+            background-color: #f2f2f2;
+        }}
+        .trade-logs-table tr:hover {{
+            background-color: #e8f5e8;
+        }}
+        </style>
+        """
+        
+        return html
+
+    def _append_trade_logs_to_html(self, html_file_path, trade_log_html, additional_stats):
+        """Append trade logs to the existing quantstats HTML file."""
+        try:
+            # Read the existing HTML file
+            with open(html_file_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            
+            # Create trade summary stats HTML
+            stats_html = ""
+            if additional_stats:
+                stats_html = f"""
+                <div class="trade-summary-section" style="margin-top: 20px; margin-bottom: 20px;">
+                    <h3 style="color: #333;">📊 Trade Summary Statistics</h3>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 15px;">
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #4CAF50;">
+                            <strong>Total Trades:</strong> {additional_stats.get('Total_Trades', 'N/A')}
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #2196F3;">
+                            <strong>Win Rate:</strong> {additional_stats.get('Win_Rate', 0):.1f}%
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #FF9800;">
+                            <strong>Average Trade P&L:</strong> {additional_stats.get('Average_Trade_PnL', 0):.2f}
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #4CAF50;">
+                            <strong>Best Trade:</strong> {additional_stats.get('Best_Trade', 0):.2f}
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #F44336;">
+                            <strong>Worst Trade:</strong> {additional_stats.get('Worst_Trade', 0):.2f}
+                        </div>
+                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #9C27B0;">
+                            <strong>Winning Trades:</strong> {additional_stats.get('Winning_Trades', 0)}
+                        </div>
+                    </div>
+                </div>
+                """
+            
+            # Find the best place to insert the trade logs (before the closing body tag)
+            insertion_point = html_content.rfind('</body>')
+            if insertion_point == -1:
+                insertion_point = html_content.rfind('</html>')
+            if insertion_point == -1:
+                insertion_point = len(html_content)
+            
+            # Insert the trade logs and stats
+            full_trade_section = stats_html + trade_log_html
+            new_html_content = (html_content[:insertion_point] + 
+                              full_trade_section + 
+                              html_content[insertion_point:])
+            
+            # Write the updated HTML file
+            with open(html_file_path, 'w', encoding='utf-8') as f:
+                f.write(new_html_content)
+            
+            print("Trade logs successfully added to HTML tearsheet")
+            
+        except Exception as e:
+            print(f" Warning: Could not append trade logs to HTML file: {e}")
+            # Create a separate trade logs HTML file as fallback
+            trade_logs_file = html_file_path.replace('.html', '_trade_logs.html')
+            try:
+                with open(trade_logs_file, 'w', encoding='utf-8') as f:
+                    f.write(f"""
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>Trade Logs</title>
+                        <meta charset="utf-8">
+                    </head>
+                    <body>
+                        <h1>Trade Logs</h1>
+                        {stats_html}
+                        {trade_log_html}
+                    </body>
+                    </html>
+                    """)
+                print(f" Trade logs saved to separate file: {trade_logs_file}")
+            except Exception as e2:
+                print(f" Could not create separate trade logs file: {e2}")
+
+    def generate_trade_logs(self, *, results: pd.Series = None, output_path=None, file_format='csv'):
+        """
+        Generate detailed trade logs as separate files (CSV/Excel) for comprehensive analysis.
+        
+        Parameters:
+        - results: pd.Series, the backtest results. If None, uses the last run results.
+        - output_path: str, the directory path to save the trade logs. Default is current directory.
+        - file_format: str, format to save ('csv', 'excel', 'both'). Default is 'csv'.
+        """
+        if results is None:
+            if self._results is None:
+                raise RuntimeError('First issue `backtest.run()` to obtain results.')
+            results = self._results
+
+        trades_df = results['_trades']
+        
+        if trades_df.empty:
+            print("No trades found to generate logs.")
+            return None
+
+        # Create enhanced trade logs
+        detailed_logs = trades_df.copy()
+        
+        # Add comprehensive trade analysis columns
+        if 'EntryTime' in detailed_logs.columns and 'ExitTime' in detailed_logs.columns:
+            detailed_logs['Entry_Date'] = pd.to_datetime(detailed_logs['EntryTime']).dt.date
+            detailed_logs['Exit_Date'] = pd.to_datetime(detailed_logs['ExitTime']).dt.date
+            detailed_logs['Entry_Time'] = pd.to_datetime(detailed_logs['EntryTime']).dt.time
+            detailed_logs['Exit_Time'] = pd.to_datetime(detailed_logs['ExitTime']).dt.time
+            
+        # Add trade performance metrics
+        detailed_logs['Win'] = detailed_logs['PnL'] > 0
+        detailed_logs['Loss'] = detailed_logs['PnL'] <= 0
+        detailed_logs['Trade_Number'] = range(1, len(detailed_logs) + 1)
+        
+        # Calculate cumulative metrics
+        detailed_logs['Cumulative_PnL'] = detailed_logs['PnL'].cumsum()
+        detailed_logs['Running_Win_Rate'] = detailed_logs['Win'].expanding().mean() * 100
+        
+        # Add trade size analysis
+        if 'PnL' in detailed_logs.columns:
+            pnl_abs = detailed_logs['PnL'].abs()
+            detailed_logs['Trade_Size_Category'] = pd.cut(
+                pnl_abs, 
+                bins=3, 
+                labels=['Small', 'Medium', 'Large']
+            )
+            
+        # Add percentage returns if possible
+        if 'EntryPrice' in detailed_logs.columns and 'ExitPrice' in detailed_logs.columns:
+            detailed_logs['Return_Pct'] = ((detailed_logs['ExitPrice'] - detailed_logs['EntryPrice']) / 
+                                         detailed_logs['EntryPrice'] * 100)
+        
+        # Add trade duration analysis
+        if 'Duration' in detailed_logs.columns:
+            detailed_logs['Duration_Days'] = detailed_logs['Duration'].dt.days
+            detailed_logs['Duration_Hours'] = detailed_logs['Duration'].dt.total_seconds() / 3600
+            
+        # Set output directory
+        current_dir = os.getcwd()
+        if output_path is None:
+            output_path = current_dir
+            
+        # Create trade logs directory if it doesn't exist
+        trade_logs_dir = os.path.join(output_path, 'trade_logs')
+        os.makedirs(trade_logs_dir, exist_ok=True)
+        
+        # Generate timestamp for unique filenames
+        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        strategy_name = getattr(results.get('_strategy'), '__class__.__name__', 'Unknown')
+        
+        # Save files based on format preference
+        saved_files = []
+        
+        if file_format in ['csv', 'both']:
+            csv_filename = os.path.join(trade_logs_dir, f'trade_logs_{strategy_name}_{timestamp}.csv')
+            detailed_logs.to_csv(csv_filename, index=False)
+            saved_files.append(csv_filename)
+            print(f"Trade logs saved to CSV: {csv_filename}")
+        
+        if file_format in ['excel', 'both']:
+            excel_filename = os.path.join(trade_logs_dir, f'trade_logs_{strategy_name}_{timestamp}.xlsx')
+            
+            # Create Excel file with multiple sheets
+            with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+                # Main trade logs
+                detailed_logs.to_excel(writer, sheet_name='Trade_Logs', index=False)
+                
+                # Summary statistics
+                summary_stats = self._generate_trade_summary(detailed_logs)
+                summary_stats.to_excel(writer, sheet_name='Summary_Stats', index=True)
+                
+                # Monthly/Weekly breakdown if applicable
+                if 'Entry_Date' in detailed_logs.columns:
+                    monthly_stats = self._generate_monthly_breakdown(detailed_logs)
+                    monthly_stats.to_excel(writer, sheet_name='Monthly_Breakdown', index=True)
+            
+            saved_files.append(excel_filename)
+            print(f"Trade logs saved to Excel: {excel_filename}")
+        
+        # Print summary statistics
+        print("\n=== Trade Log Summary ===")
+        print(f"Total Trades: {len(detailed_logs)}")
+        print(f"Winning Trades: {detailed_logs['Win'].sum()}")
+        print(f"Losing Trades: {detailed_logs['Loss'].sum()}")
+        print(f"Win Rate: {detailed_logs['Win'].mean() * 100:.2f}%")
+        print(f"Total PnL: {detailed_logs['PnL'].sum():.2f}")
+        print(f"Average Trade PnL: {detailed_logs['PnL'].mean():.2f}")
+        print(f"Best Trade: {detailed_logs['PnL'].max():.2f}")
+        print(f"Worst Trade: {detailed_logs['PnL'].min():.2f}")
+        
+        return saved_files
+    
+    def _generate_trade_summary(self, trades_df):
+        """Generate summary statistics from trade logs."""
+        summary = pd.Series({
+            'Total_Trades': len(trades_df),
+            'Winning_Trades': trades_df['Win'].sum(),
+            'Losing_Trades': trades_df['Loss'].sum(),
+            'Win_Rate_Pct': trades_df['Win'].mean() * 100,
+            'Total_PnL': trades_df['PnL'].sum(),
+            'Average_Trade_PnL': trades_df['PnL'].mean(),
+            'Median_Trade_PnL': trades_df['PnL'].median(),
+            'Best_Trade': trades_df['PnL'].max(),
+            'Worst_Trade': trades_df['PnL'].min(),
+            'PnL_Std_Dev': trades_df['PnL'].std(),
+            'Average_Winner': trades_df[trades_df['Win']]['PnL'].mean() if trades_df['Win'].any() else 0,
+            'Average_Loser': trades_df[trades_df['Loss']]['PnL'].mean() if trades_df['Loss'].any() else 0,
+            'Profit_Factor': (trades_df[trades_df['Win']]['PnL'].sum() / 
+                            abs(trades_df[trades_df['Loss']]['PnL'].sum())) if trades_df['Loss'].any() else float('inf'),
+        })
+        
+        if 'Duration_Days' in trades_df.columns:
+            summary['Average_Trade_Duration_Days'] = trades_df['Duration_Days'].mean()
+            summary['Median_Trade_Duration_Days'] = trades_df['Duration_Days'].median()
+        
+        return summary
+    
+    def _generate_monthly_breakdown(self, trades_df):
+        """Generate monthly breakdown of trade performance."""
+        if 'Entry_Date' not in trades_df.columns:
+            return pd.DataFrame()
+            
+        trades_df['Entry_Month'] = pd.to_datetime(trades_df['Entry_Date']).dt.to_period('M')
+        
+        monthly_stats = trades_df.groupby('Entry_Month').agg({
+            'PnL': ['count', 'sum', 'mean'],
+            'Win': ['sum', 'mean']
+        }).round(2)
+        
+        monthly_stats.columns = ['Trade_Count', 'Total_PnL', 'Avg_PnL', 'Winning_Trades', 'Win_Rate']
+        return monthly_stats
     
 
 
