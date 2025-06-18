@@ -11,7 +11,7 @@ from math import copysign
 from numbers import Number
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 import webbrowser
-from stats import compute_stats
+from core.stats import compute_stats
 
 try:
     # Patch the problematic magic method before importing quantstats

@@ -9,6 +9,12 @@ import itertools
 import datetime
 from openpyxl.drawing.image import Image
 import json
+from functools import partial
+from backtesting_opt1 import Backtest
+from functools import partial, lru_cache
+from core.backtesting_opt1 import Backtest
+from typing import Union, Tuple, Callable
+from tqdm import tqdm as _tqdm
 from functools import partial, lru_cache
 from backtesting_opt1 import Backtest
 from typing import Union, Tuple, Callable
@@ -84,18 +90,27 @@ class HyperParameterOptimizer:
         for idx, flat_params in enumerate(param_combinations, 1):
             print(f"Testing parameters {idx}/{len(param_combinations)}: {flat_params}")
 
-            # Construct the full parameter dictionary
+            # Construct the full parameter dictionary dynamically
+            iv_slope_thresholds = {}
+            other_params = {}
+            
+            for key, value in flat_params.items():
+                if "threshold" in key:
+                    iv_slope_thresholds[key] = value
+                else:
+                    other_params[key] = value
+            
             params = {
-                "iv_slope_thresholds": {
-                    "upper_gamma": flat_params["upper_gamma"],
-                    "upper_buffer": flat_params["upper_buffer"],
-                    "lower_buffer": flat_params["lower_buffer"],
-                    "lower_gamma": flat_params["lower_gamma"]
-                },
-                "portfolio_sl": flat_params.get("portfolio_sl", 0.01),  # Default if not optimized
-                "portfolio_tp": flat_params.get("portfolio_tp", 0.03),  # Default if not optimized
+                "iv_slope_thresholds": iv_slope_thresholds,
+                "portfolio_sl": other_params.get("portfolio_sl", 0.01),  # Default if not optimized
+                "portfolio_tp": other_params.get("portfolio_tp", 0.03),  # Default if not optimized
                 "legs": self.legs  # Pass legs as a parameter
             }
+            
+            # Add any other non-special parameters to the top level
+            for key, value in other_params.items():
+                if key not in ["portfolio_sl", "portfolio_tp"]:
+                    params[key] = value
 
             try:
                 backtest = self._backtest_factory()
@@ -191,6 +206,28 @@ class HyperParameterOptimizer:
         def memoized_run(param_tuple):
             flat_params = dict(param_tuple)
             
+            # Construct the full parameter dictionary dynamically
+            iv_slope_thresholds = {}
+            other_params = {}
+            
+            for key, value in flat_params.items():
+                if "threshold" in key:
+                    iv_slope_thresholds[key] = value
+                else:
+                    other_params[key] = value
+            
+            params = {
+                "iv_slope_thresholds": iv_slope_thresholds,
+                "portfolio_sl": other_params.get("portfolio_sl", 0.01),
+                "portfolio_tp": other_params.get("portfolio_tp", 0.03),
+                "legs": self.legs
+            }
+            
+            # Add any other non-special parameters to the top level
+            for key, value in other_params.items():
+                if key not in ["portfolio_sl", "portfolio_tp"]:
+                    params[key] = value
+            
             # Construct the full parameter dictionary
             params = {
                 "iv_slope_thresholds": {
@@ -272,6 +309,29 @@ class HyperParameterOptimizer:
             print("Falling back to grid search...")
             return self._optimize_grid(hyperparameter_grid, maximize, start_date, end_date, max_tries, constraint)
 
+        # Get the best parameters and reconstruct full parameter dict dynamically
+        best_flat_params = dict(zip(param_names, res.x))
+        
+        iv_slope_thresholds = {}
+        other_params = {}
+        
+        for key, value in best_flat_params.items():
+            if "threshold" in key:
+                iv_slope_thresholds[key] = value
+            else:
+                other_params[key] = value
+        
+        best_params = {
+            "iv_slope_thresholds": iv_slope_thresholds,
+            "portfolio_sl": other_params.get("portfolio_sl", 0.01),
+            "portfolio_tp": other_params.get("portfolio_tp", 0.03),
+            "legs": self.legs
+        }
+        
+        # Add any other non-special parameters to the top level
+        for key, value in other_params.items():
+            if key not in ["portfolio_sl", "portfolio_tp"]:
+                best_params[key] = value
         # Get the best parameters and reconstruct full parameter dict
         best_flat_params = dict(zip(param_names, res.x))
         best_params = {
