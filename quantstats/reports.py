@@ -136,6 +136,12 @@ def html(
     returns = _utils._prepare_returns(returns)
 
     strategy_title = kwargs.get("strategy_title", "Strategy")
+    
+    # Defensive programming: ensure strategy_title is always a string or list of strings
+    if not isinstance(strategy_title, (str, list)):
+        print(f"Warning: strategy_title is {type(strategy_title)}, converting to string")
+        strategy_title = str(strategy_title) if strategy_title is not None else "Strategy"
+    
     if (
         isinstance(returns, _pd.DataFrame)
         and len(returns.columns) > 1
@@ -152,6 +158,11 @@ def html(
                 benchmark_title = benchmark.name
             elif isinstance(benchmark, _pd.DataFrame):
                 benchmark_title = benchmark[benchmark.columns[0]].name
+        
+        # Defensive programming: ensure benchmark_title is always a string
+        if not isinstance(benchmark_title, str):
+            print(f"Warning: benchmark_title is {type(benchmark_title)}, converting to string")
+            benchmark_title = str(benchmark_title) if benchmark_title is not None else "Benchmark"
 
         tpl = tpl.replace(
             "{{benchmark_title}}", f"Benchmark is {benchmark_title.upper()} | "
@@ -178,6 +189,33 @@ def html(
     if isinstance(returns, _pd.Series):
         returns.name = strategy_title
     elif isinstance(returns, _pd.DataFrame):
+        # Final safety check before setting columns
+        if isinstance(strategy_title, list):
+            if not all(isinstance(x, str) for x in strategy_title):
+                print(f"Warning: strategy_title list contains non-string elements: {strategy_title}")
+                strategy_title = [str(x) for x in strategy_title]
+        elif not isinstance(strategy_title, str):
+            print(f"Error: strategy_title is {type(strategy_title)}, expected str or list")
+            strategy_title = str(strategy_title) if strategy_title is not None else "Strategy"
+        
+        # For DataFrames, ensure strategy_title is a list that matches the number of columns
+        if isinstance(strategy_title, str):
+            # If single string, convert to list for DataFrame columns
+            if len(returns.columns) == 1:
+                strategy_title = [strategy_title]
+            else:
+                # Multiple columns but single title - replicate or use column numbers
+                strategy_title = [f"{strategy_title}_{i+1}" for i in range(len(returns.columns))]
+        elif isinstance(strategy_title, list):
+            # Ensure list length matches number of columns
+            if len(strategy_title) != len(returns.columns):
+                print(f"Warning: strategy_title list length ({len(strategy_title)}) doesn't match columns ({len(returns.columns)})")
+                if len(strategy_title) == 1 and len(returns.columns) == 1:
+                    pass  # This is fine
+                else:
+                    # Adjust the list to match column count
+                    strategy_title = strategy_title[:len(returns.columns)] + [f"Column_{i+1}" for i in range(len(strategy_title), len(returns.columns))]
+        
         returns.columns = strategy_title
 
     mtrx = metrics(
@@ -199,46 +237,60 @@ def html(
     tpl = tpl.replace("{{metrics}}", _html_table(mtrx))
 
     # Add all of the summary metrics
+    
+    def _safe_metric_extract(metric_name, strategy_title):
+        """Safely extract metric value and convert to string"""
+        try:
+            value = mtrx.loc[metric_name, strategy_title]
+            if isinstance(value, _pd.Series):
+                # If it's a Series, take the first value
+                value = value.iloc[0] if len(value) > 0 else "N/A"
+            # Convert to string, handling NaN and None
+            if _pd.isna(value) or value is None:
+                return "N/A"
+            return str(value)
+        except (KeyError, IndexError):
+            return "N/A"
 
     # CAGR #
     # Get the value of the "Strategy" column where the "Metric" column is "CAGR% (Annual Return)"
-    cagr = mtrx.loc["CAGR% (Annual Return)", strategy_title]
+    cagr = _safe_metric_extract("CAGR% (Annual Return)", strategy_title)
     # Add the CAGR to the template
     tpl = tpl.replace("{{cagr}}", cagr)
 
     # Total Return #
     # Get the value of the "Strategy" column where the "Metric" column is "Total Return"
-    total_return = mtrx.loc["Total Return", strategy_title]
+    total_return = _safe_metric_extract("Total Return", strategy_title)
     # Add the total return to the template
     tpl = tpl.replace("{{total_return}}", total_return)
 
     # Max Drawdown #
     # Get the value of the "Strategy" column where the "Metric" column is "Max Drawdown"
-    max_drawdown = mtrx.loc["Max Drawdown", strategy_title]
+    max_drawdown = _safe_metric_extract("Max Drawdown", strategy_title)
     # Add the max drawdown to the template
     tpl = tpl.replace("{{max_drawdown}}", max_drawdown)
 
     # RoMaD #
     # Get the value of the "Strategy" column where the "Metric" column is "RoMaD"
-    romad = mtrx.loc["RoMaD", strategy_title]
+    romad = _safe_metric_extract("RoMaD", strategy_title)
     # Add the RoMaD to the template
     tpl = tpl.replace("{{romad}}", romad)
 
     # Longest Drawdown Duration #
     # Get the value of the "Strategy" column where the "Metric" column is "Longest Drawdown Duration"
-    longest_dd_days = mtrx.loc["Longest DD Days", strategy_title]
+    longest_dd_days = _safe_metric_extract("Longest DD Days", strategy_title)
     # Add the longest drawdown duration to the template
     tpl = tpl.replace("{{longest_dd_days}}", longest_dd_days)
 
     # Sharpe #
     # Get the value of the "Strategy" column where the "Metric" column is "Sharpe"
-    sharpe = mtrx.loc["Sharpe", strategy_title]
+    sharpe = _safe_metric_extract("Sharpe", strategy_title)
     # Add the Sharpe to the template
     tpl = tpl.replace("{{sharpe}}", sharpe)
 
     # Sortino #
     # Get the value of the "Strategy" column where the "Metric" column is "Sortino"
-    sortino = mtrx.loc["Sortino", strategy_title]
+    sortino = _safe_metric_extract("Sortino", strategy_title)
     # Add the Sortino to the template
     tpl = tpl.replace("{{sortino}}", sortino)
 
@@ -1144,17 +1196,17 @@ def metrics(
             elif isinstance(returns, _pd.DataFrame):
                 metrics["R^2"] = (
                     [
-                        _stats.r_squared(
+                        round(float(_stats.r_squared(
                             df[strategy_col], df["benchmark"], prepare_returns=False
-                        ).round(2)
+                        )), 2)
                         for strategy_col in df_strategy_columns
                     ]
                 ) + ["-"]
                 metrics["Information Ratio"] = (
                     [
-                        _stats.information_ratio(
+                        round(float(_stats.information_ratio(
                             df[strategy_col], df["benchmark"], prepare_returns=False
-                        ).round(2)
+                        )), 2)
                         for strategy_col in df_strategy_columns
                     ]
                 ) + ["-"]

@@ -344,9 +344,24 @@ def plot_timeseries(
     # Set y-axis limits to avoid blank space at the bottom and top
     min_val = returns.min()
     max_val = returns.max()
+    
+    # Ensure min_val and max_val are scalars, not Series
+    if hasattr(min_val, 'min'):  # If it's a Series/DataFrame
+        min_val = min_val.min()
+    if hasattr(max_val, 'max'):  # If it's a Series/DataFrame
+        max_val = max_val.max()
+    
     if benchmark is not None:
-        min_val = min(min_val, benchmark.min())
-        max_val = max(max_val, benchmark.max())
+        bench_min = benchmark.min()
+        bench_max = benchmark.max()
+        # Ensure benchmark min/max are scalars
+        if hasattr(bench_min, 'min'):
+            bench_min = bench_min.min()
+        if hasattr(bench_max, 'max'):
+            bench_max = bench_max.max()
+        
+        min_val = min(min_val, bench_min)
+        max_val = max(max_val, bench_max)
     ax.set_ylim(bottom=min_val, top=max_val)
 
     if percent:

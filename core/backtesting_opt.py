@@ -45,13 +45,13 @@ try:
     # Verify quantstats folder exists and import
     if os.path.exists(quantstats_path) and os.path.isdir(quantstats_path):
         import quantstats
-        print(f"✅ Successfully imported local quantstats from: {quantstats_path}")
+        print(f" Successfully imported local quantstats from: {quantstats_path}")
     else:
         raise ImportError(f"Quantstats folder not found at: {quantstats_path}")
         
 except ImportError as e:
     quantstats = None
-    print(f"❌ Failed to import local quantstats: {e}")
+    print(f" Failed to import local quantstats: {e}")
     warnings.warn("Local quantstats folder not found. Please ensure you're running from the FnO-Synapse directory with the quantstats folder present.")
 
 import numpy as np
@@ -174,7 +174,7 @@ class Strategy(ABC):
 
 
     def __repr__(self):
-        return '<Strategy ' + str(self) + '>'
+        return f'<Strategy {self.__class__.__name__}>'
     
 #   def __str__(self): not defined as in synapse
     
@@ -997,6 +997,7 @@ class Backtest:
             orders=processed_orders,
             trades=broker.closed_trades,
             equity_curve=equity_curve,
+            strategy_instance=strategy,
         )
         stats['_trade_start_bar'] = first_trade_bar
         
@@ -1163,7 +1164,7 @@ class Backtest:
             print(f"Running optimization on {len(param_combos)} parameter combinations...")
             for i, params in enumerate(_tqdm(param_combos, desc='Optimizing')):
                 try:
-                    stats = self.run(**params)
+                    stats = self.run(start_date=start_date, end_date=end_date, **params)
                     value = maximize(stats) 
                     heatmap[tuple(params.values())] = value
                     
@@ -1226,7 +1227,7 @@ class Backtest:
             # Avoid recomputing re-evaluations:
             # "The objective has been evaluated at this point before."
             # https://github.com/scikit-optimize/scikit-optimize/issues/302
-            memoized_run = lru_cache()(lambda tup: self.run(**dict(tup)))
+            memoized_run = lru_cache()(lambda tup: self.run(start_date=start_date, end_date=end_date, **dict(tup)))
 
             # np.inf/np.nan breaks sklearn, np.finfo(float).max breaks skopt.plots.plot_objective
             INVALID = 1e300
