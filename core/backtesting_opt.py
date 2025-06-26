@@ -15,34 +15,44 @@ import webbrowser
 
 import numpy as np
 from numpy.random import default_rng
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+    _tqdm = partial(_tqdm, leave=False)
+except ImportError:
+    def _tqdm(seq, **_):
+        return seq
+
+# Removed conflicting quantstats imports as we have our own implementations
+
+
+
 from core.stats import compute_stats
 try:
-    # Patch the problematic magic method before importing quantstats
-    try:
-        from IPython import get_ipython
-        ipython = get_ipython()
-        if ipython is not None and not hasattr(ipython, 'magic'):
-            # Add compatibility method for older quantstats versions
-            def magic(line):
-                try:
-                    if line == "matplotlib inline":
-                        ipython.run_line_magic('matplotlib', 'inline')
-                    else:
-                        parts = line.split(' ', 1)
-                        if len(parts) == 2:
-                            ipython.run_line_magic(parts[0], parts[1])
-                        else:
-                            ipython.run_line_magic(parts[0], '')
-                except Exception:
-                    pass  # Silently ignore matplotlib inline errors
-            ipython.magic = magic
-    except ImportError:
-        pass  # Not in IPython/Jupyter environment
+    # Import from local quantstats folder in FnO-Synapse workspace
+    import sys
+    import os
     
-    import quantstats_lumi as quantstats
-except ImportError:
+    # Get the path to the quantstats folder
+    current_dir = os.path.dirname(os.path.abspath(__file__))  # core directory
+    workspace_root = os.path.dirname(current_dir)  # FnO-Synapse directory
+    quantstats_path = os.path.join(workspace_root, 'quantstats')
+    
+    # Add workspace root to sys.path for importing quantstats
+    if workspace_root not in sys.path:
+        sys.path.insert(0, workspace_root)
+    
+    # Verify quantstats folder exists and import
+    if os.path.exists(quantstats_path) and os.path.isdir(quantstats_path):
+        import quantstats
+        print(f" Successfully imported local quantstats from: {quantstats_path}")
+    else:
+        raise ImportError(f"Quantstats folder not found at: {quantstats_path}")
+        
+except ImportError as e:
     quantstats = None
-    warnings.warn("quantstats not installed. tear_sheet method will not work unless quantstats is installed.")
+    print(f" Failed to import local quantstats: {e}")
+    warnings.warn("Local quantstats folder not found. Please ensure you're running from the FnO-Synapse directory with the quantstats folder present.")
 
 import numpy as np
 import pandas as pd
@@ -58,7 +68,7 @@ import pandas as pd
 from typing import Dict, Optional, List
 
 class _Data:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, start_date: Optional[str] = None, end_date: Optional[str] = None):
         self._conn = None
         self._table_names: List[str] = []                     # List of table names in the database
         self._ticker_map: Dict[str, pd.DataFrame] = {}        # Ticker-wise grouped data
@@ -67,6 +77,8 @@ class _Data:
         self._time: Optional[pd.Timestamp] = None
         self._spot: Optional[float] = None
         self._tte_to_expiry: Optional[Dict] = None
+        self._start_date = start_date
+        self._end_date = end_date
         self.connect_db(db_path)                              # Initialize connection and load table names
 
     def connect_db(self, db_path: str):
@@ -81,7 +93,16 @@ class _Data:
         self._spot_table = None
 
     def load_table(self, table_name: str):
-        df = self._conn.execute(f"SELECT * FROM {table_name} ORDER BY timestamp").fetchdf()
+        query = f"SELECT * FROM {table_name}"
+        conditions = []
+        if self._start_date:
+            conditions.append(f"timestamp >= '{self._start_date}'")
+        if self._end_date:
+            conditions.append(f"timestamp <= '{self._end_date}'")
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY timestamp"
+        df = self._conn.execute(query).fetchdf()
         # df["timestamp"] = df["timestamp"].dt.tz_localize("Asia/Kolkata").dt.tz_convert(None)
         # df["expiry_date"] = df["expiry_date"].dt.tz_localize("Asia/Kolkata").dt.tz_convert(None)
         self._tte_to_expiry = df.drop_duplicates("expiry_date").set_index("Time_to_expiry")["expiry_date"].to_dict()
@@ -103,6 +124,37 @@ class _Data:
             return None
         return subset_df.loc[asof_time]
 
+    def get_tables_in_date_range(self) -> List[str]:
+        """
+        Filter tables that have data within the specified date range.
+        Returns a list of table names that contain data in the date range.
+        """
+        tables_to_process = []
+        
+        print("Identifying tables in date range...")
+        for table in self._table_names:
+            try:
+                # Quick check if table has data in range
+                query = f"SELECT COUNT(*) as count FROM {table}"
+                conditions = []
+                if self._start_date:
+                    conditions.append(f"timestamp >= '{self._start_date}'")
+                if self._end_date:
+                    conditions.append(f"timestamp <= '{self._end_date}'")
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+                    
+                result = self._conn.execute(query).fetchone()
+                if result and result[0] > 0:  # Has data in date range
+                    tables_to_process.append(table)
+            except Exception as e:
+                print(f"Warning: Could not check table {table}: {e}")
+                # Add to process list anyway in case it has data
+                tables_to_process.append(table)
+        
+        print(f"Found {len(tables_to_process)} tables out of {len(self._table_names)} total tables with data in range")
+        return tables_to_process
+
     def close(self):
         self._conn.close()
 
@@ -122,7 +174,7 @@ class Strategy(ABC):
 
 
     def __repr__(self):
-        return '<Strategy ' + str(self) + '>'
+        return f'<Strategy {self.__class__.__name__}>'
     
 #   def __str__(self): not defined as in synapse
     
@@ -646,7 +698,7 @@ class _Broker:
             # Get expiry from the first trade (assume all trades for a symbol have same expiry)
             # This requires ticker to be parsable or options_data to have expiry_date
             contract_details = self.get_ticker_details(ticker)
-            if 'expiry_date' not in contract_details:
+            if contract_details is None or 'expiry_date' not in contract_details:
                 warnings.warn(f"Cannot determine expiry for {ticker}. Skipping expiration check.")
                 continue
 
@@ -680,6 +732,11 @@ class _Broker:
         for ticker in list(self.trades.keys()):
             for trade in list(self.trades.get(ticker, [])): # Iterate copy
                 last_price = self.get_ticker_last_price(ticker)
+                
+                if last_price is None:
+                    # If no price is available, use the entry price as a fallback
+                    last_price = trade.entry_price
+                    warnings.warn(f"No exit price available for {ticker}. Using entry price {last_price} for finalization.")
 
                 print(f"Finalizing trade for {ticker} at price {last_price}")
                 self._close_trade(trade, last_price, tag="EndOfTest")
@@ -752,6 +809,11 @@ class _Broker:
         assert trade.size * size_change <= 0, "size_change must be opposite or reduce existing trade size"
         assert abs(trade.size) >= abs(size_change)
 
+        # Safety check for price
+        if price is None:
+            price = trade.entry_price
+            warnings.warn(f"price is None for trade {trade.ticker}. Using entry price {price} as fallback.")
+
         size_left = trade.size + size_change # e.g. 10 + (-5) = 5
         
         # Create a "closing" trade record for the portion being closed
@@ -782,6 +844,11 @@ class _Broker:
             if not self.trades[trade.ticker]: # List is now empty
                 del self.trades[trade.ticker]
 
+        # Safety check for exec_price
+        if exec_price is None:
+            exec_price = trade.entry_price
+            warnings.warn(f"exec_price is None for trade {trade.ticker}. Using entry price {exec_price} as fallback.")
+
         trade._replace(exit_price=exec_price, exit_datetime=self.time, exit_spot=self.spot, exit_tag=tag)
         self.closed_trades.append(trade)
         # Update cash based on the realized P&L of this trade
@@ -790,6 +857,12 @@ class _Broker:
         self._cash += (trade_value - commission_cost) # Add P&L to cash
 
     def _open_trade(self, order: Order, exec_price: float):
+        # Safety check for exec_price
+        if exec_price is None:
+            warnings.warn(f"exec_price is None for order {order.ticker}. Cannot open trade. Order skipped.")
+            self.orders.remove(order)
+            return
+
         trade = Trade(self, order.strategy_id, order.position_id, order.leg_id,
                       order.ticker, order.size, exec_price, self.time, self.spot,
                       stop_loss=order.stop_loss, take_profit=order.take_profit,
@@ -824,10 +897,17 @@ class Backtest:
             option_multiplier=option_multiplier)
         self._strategy = strategy
         self._results: Optional[pd.Series] = None
+        self._start_date = None
+        self._end_date = None
 
     def run(self, **kwargs) -> pd.Series:
-        data = _Data(self.db_path)
-        data._table_names = data._table_names[90:203] # For testing, load only a few tables
+        start_date = kwargs.pop("start_date", None)
+        end_date = kwargs.pop("end_date", None)
+        self._start_date = start_date
+        self._end_date = end_date
+        data = _Data(self.db_path, start_date, end_date)
+            
+        data._table_names = data._table_names
         broker: _Broker = self._broker_factory(data=data)
         strategy: Strategy = self._strategy(broker, data, kwargs)
         processed_orders: List[Order] = []
@@ -842,10 +922,18 @@ class Backtest:
             traceback.print_exc()
             return pd.Series(name="StrategyInitError") # Return empty/error series
 
-        progress_bar = _tqdm(data._table_names, desc="Backtesting Options Strategy")
+        # Get tables that have data in the specified date range
+        tables_to_process = data.get_tables_in_date_range()
+        
+        progress_bar = _tqdm(tables_to_process, desc="Backtesting Options Strategy")
         break_outer_loop = False
-        for table in data._table_names:
+        for table in tables_to_process:
             data.load_table(table)
+            
+            # Skip if no data was loaded for this table in the date range
+            if data._spot_table is None or data._spot_table.empty:
+                progress_bar.update(1)
+                continue
 
             for row in data._spot_table.itertuples():
                 # Process each row in the spot data
@@ -909,6 +997,7 @@ class Backtest:
             orders=processed_orders,
             trades=broker.closed_trades,
             equity_curve=equity_curve,
+            strategy_instance=strategy,
         )
         stats['_trade_start_bar'] = first_trade_bar
         
@@ -991,6 +1080,9 @@ class Backtest:
         """
         if not kwargs:
             raise ValueError('Need some strategy parameters to optimize')
+        
+        start_date = kwargs.pop("start_date", None)
+        end_date = kwargs.pop("end_date", None)
 
         maximize_key = None
         if isinstance(maximize, str):
@@ -1072,7 +1164,7 @@ class Backtest:
             print(f"Running optimization on {len(param_combos)} parameter combinations...")
             for i, params in enumerate(_tqdm(param_combos, desc='Optimizing')):
                 try:
-                    stats = self.run(**params)
+                    stats = self.run(start_date=start_date, end_date=end_date, **params)
                     value = maximize(stats) 
                     heatmap[tuple(params.values())] = value
                     
@@ -1088,12 +1180,12 @@ class Backtest:
             if heatmap.isna().all():
                 # Handle case where all values in the series are NA
                 print("Warning: All optimization runs failed. Using first parameter set.")
-                stats = self.run(**param_combos[0])
+                stats = self.run(start_date=start_date,end_date=end_date,**param_combos[0])
             else:
                 best_params = heatmap.idxmax(skipna=True)
                 print(f"Best parameters found: {dict(zip(heatmap.index.names, best_params))}")
                 print(f"Best score: {heatmap.max()}")
-                stats = self.run(**dict(zip(heatmap.index.names, best_params)))
+                stats = self.run(start_date=start_date,end_date=end_date,**dict(zip(heatmap.index.names, best_params)))
 
             if return_heatmap:
                 return stats, heatmap
@@ -1135,7 +1227,7 @@ class Backtest:
             # Avoid recomputing re-evaluations:
             # "The objective has been evaluated at this point before."
             # https://github.com/scikit-optimize/scikit-optimize/issues/302
-            memoized_run = lru_cache()(lambda tup: self.run(**dict(tup)))
+            memoized_run = lru_cache()(lambda tup: self.run(start_date=start_date, end_date=end_date, **dict(tup)))
 
             # np.inf/np.nan breaks sklearn, np.finfo(float).max breaks skopt.plots.plot_objective
             INVALID = 1e300
@@ -1170,7 +1262,7 @@ class Backtest:
                     callback=DeltaXStopper(9e-7),
                     random_state=random_state)
 
-            stats = self.run(**dict(zip(kwargs.keys(), res.x)))
+            stats = self.run(start_date=start_date,end_date=end_date,**dict(zip(kwargs.keys(), res.x)))
             output = [stats]
 
             if return_heatmap:
@@ -1221,7 +1313,7 @@ class Backtest:
             @lru_cache()
             def memoized_run(tup):
                 nonlocal maximize, self
-                stats = self.run(**dict(tup))
+                stats = self.run(start_date=start_date,end_date=end_date,**dict(tup))
                 return -maximize(stats)
 
             progress = iter(_tqdm(repeat(None), total=max_tries, leave=False,
@@ -1249,7 +1341,7 @@ class Backtest:
                 method='sceua',
                 rng=random_state)
 
-            stats = self.run(**dict(zip(kwargs.keys(), res.x)))
+            stats = self.run(start_date=start_date,end_date=end_date,**dict(zip(kwargs.keys(), res.x)))
             output = [stats]
 
             if return_heatmap:
@@ -1276,543 +1368,265 @@ class Backtest:
         return output
 
     
-    def tear_sheet(self, *, results: pd.Series = None, plotting_date=None, filename=None, open_browser=True, output_path=None, generate_trade_logs=True):
+    def plot(self, *, results: pd.Series = None, filename=None, plot_width=None,
+             plot_equity=True, plot_return=False, plot_pl=True,
+             plot_volume=False, plot_drawdown=False, plot_trades=True,
+             smooth_equity=False, relative_equity=True,
+             superimpose: Union[bool, str] = False,
+             resample=True, reverse_indicators=False,
+             show_legend=True, open_browser=True,
+             plot_allocation=False, relative_allocation=True,
+             plot_indicator=True):
+        """
+        Plot the progression of the last backtest run.
+
+        If `results` is provided, it should be a particular result
+        `pd.Series` such as returned by
+        `Backtest.run` or `Backtest.optimize`, otherwise the last
+        run's results are used.
+
+        `filename` is the path to save the interactive HTML plot to.
+        By default, a strategy/parameter-dependent file is created in the
+        current working directory.
+
+        `plot_width` is the width of the plot in pixels. If None (default),
+        the plot is made to span 100% of browser width. The height is
+        currently non-adjustable.
+
+        If `plot_equity` is `True`, the resulting plot will contain
+        an equity (initial cash plus assets) graph section. This is the same
+        as `plot_return` plus initial 100%.
+
+        If `plot_return` is `True`, the resulting plot will contain
+        a cumulative return graph section. This is the same
+        as `plot_equity` minus initial 100%.
+
+        If `plot_pl` is `True`, the resulting plot will contain
+        a profit/loss (P/L) indicator section.
+
+        If `plot_volume` is `True`, the resulting plot will contain
+        a trade volume section.
+
+        If `plot_drawdown` is `True`, the resulting plot will contain
+        a separate drawdown graph section.
+
+        If `plot_trades` is `True`, the stretches between trade entries
+        and trade exits are marked by hash-marked tractor beams.
+
+        If `smooth_equity` is `True`, the equity graph will be
+        interpolated between fixed points at trade closing times,
+        unaffected by any interim asset volatility.
+
+        If `relative_equity` is `True`, scale and label equity graph axis
+        with return percent, not absolute cash-equivalent values.
+
+        If `superimpose` is `True`, superimpose larger-timeframe candlesticks
+        over the original candlestick chart. Default downsampling rule is:
+        monthly for daily data, daily for hourly data, hourly for minute data,
+        and minute for (sub-)second data.
+        `superimpose` can also be a valid [Pandas offset string],
+        such as `'5T'` or `'5min'`, in which case this frequency will be
+        used to superimpose.
+        Note, this only works for data with a datetime index.
+
+        If `resample` is `True`, the OHLC data is resampled in a way that
+        makes the upper number of candles for Bokeh to plot limited to 10_000.
+        This may, in situations of overabundant data,
+        improve plot's interactive performance and avoid browser's
+        `Javascript Error: Maximum call stack size exceeded` or similar.
+        Equity & dropdown curves and individual trades data is,
+        `resample` can also be a [Pandas offset string],
+        such as `'5T'` or `'5min'`, in which case this frequency will be
+        used to resample, overriding above numeric limitation.
+        Note, all this only works for data with a datetime index.
+
+        If `reverse_indicators` is `True`, the indicators below the OHLC chart
+        are plotted in reverse order of declaration.
+
+        [Pandas offset string]: \
+            https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#dateoffset-objects
+
+        If `show_legend` is `True`, the resulting plot graphs will contain
+        labeled legends.
+
+        If `open_browser` is `True`, the resulting `filename` will be
+        opened in the default web browser.
+
+        If `plot_allocation` is `True`, the resulting plot will contain
+        an equity allocation graph section. 
+
+        If `relative_allocation` is `True`, scale and label equity allocation graph axis
+        with return percent, not absolute cash-equivalent values.
+
+        If `plot_indicator` is `True`, the resulting plot will contain
+        a section for each indicator used in the strategy.
+        """
+        if results is None:
+            if self._results is None:
+                raise RuntimeError('First issue `backtest.run()` to obtain results.')
+            results = self._results
+        if quantstats is not None:
+            try:
+                # Extract equity curve for plotting
+                equity_df = results.get('_equity_curve')
+                if equity_df is not None:
+                    equity_series = equity_df['Equity']
+                    returns_series = equity_series.pct_change().dropna()
+                    
+                    # Set filename
+                    if filename is None:
+                        filename = 'backtest_plot.html'
+                    
+                    # Use quantstats plotting functionality
+                    if plot_equity:
+                        quantstats.plots.snapshot(
+                            returns_series,
+                            title=f"Backtest Results - {results.get('_strategy', 'Strategy')}",
+                            figsize=(12, 8),
+                            savefig=filename,
+                            show=open_browser
+                        )
+                        print(f"Equity plot saved to {filename}")
+                    
+                    # Additional plot options
+                    if plot_drawdown:
+                        dd_filename = filename.replace('.html', '_drawdown.html') if filename.endswith('.html') else f'{filename}_drawdown.html'
+                        quantstats.plots.drawdown(
+                            returns_series,
+                            savefig=dd_filename,
+                            show=open_browser
+                        )
+                        print(f"Drawdown plot saved to {dd_filename}")
+                    
+                    if plot_return:
+                        returns_filename = filename.replace('.html', '_returns.html') if filename.endswith('.html') else f'{filename}_returns.html'
+                        quantstats.plots.returns(
+                            returns_series,
+                            savefig=returns_filename,
+                            show=open_browser
+                        )
+                        print(f"Returns plot saved to {returns_filename}")
+                        
+                else:
+                    print("No equity curve data available for plotting")
+            except Exception as e:
+                print(f"Error generating plot: {e}")
+                print("Plotting functionality requires proper equity curve data")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("Local quantstats not available. Please ensure the quantstats folder is in your workspace.")
+
+    
+    def tear_sheet(self, *, results: pd.Series = None, plotting_date = None, filename=None, open_browser=True, output_path=None, equity_curve=False):
         """
         Generate a detailed tear sheet report using quantstats.
         
         Parameters:
         - results: pd.Series, the backtest results. If None, uses the last run results.
-        - plotting_date: datetime, start date for plotting data (optional).
+        - plotting_date: datetime, start date for plotting. If None, uses all data.
         - filename: str, the file path to save the HTML report. Default is 'tearsheet.html'.
         - open_browser: bool, whether to open the report in a browser. Default is True.
         - output_path: str, the directory path to save the HTML report. Default is current directory.
-        - generate_trade_logs: bool, whether to automatically generate detailed trade logs. Default is True.
+        - equity_curve: bool, whether to include backtest equity curve data.
         """
-        if quantstats is None:
-            raise ImportError("quantstats is required for tear_sheet. Install it using `pip install quantstats-lumi`.")
-
         if results is None:
             if self._results is None:
                 raise RuntimeError('First issue `backtest.run()` to obtain results.')
             results = self._results
 
-        # Extract equity curve and prepare series for quantstats
-        equity_df = results['_equity_curve']
-        equity_series = equity_df['Equity'].resample('1D').last().pct_change().dropna() #changed to daily
+        if quantstats is None:
+            raise ImportError("quantstats is required for tear_sheet functionality. Please install quantstats.")
+
+        # Get equity data from results
+        equity_df = results.get('_equity_curve')
+        if equity_df is None:
+            raise ValueError("No equity curve data found in results. Cannot generate tear sheet.")
         
-        # Check if benchmark is already provided in results, otherwise create one
-        benchmark_series = None
-        if '_benchmark' in results and results['_benchmark'] is not None:
-            benchmark_series = results['_benchmark']
-            print(f"Using provided benchmark with {len(benchmark_series)} data points")
-        else:
-            # Create a simple benchmark (buy and hold) or use None
-            # For now, we'll create a benchmark by loading data again (could be optimized)
-            try:
-                data = _Data(self.db_path)  # Create _Data instance without context manager
-                # Sample some data to create a benchmark - use same range as in run method
-                sample_tables = data._table_names[90:203]
-                daily_benchmark_data = []
-                
-                print(f"Creating benchmark from {len(sample_tables)} tables...")
-                
-                for table in sample_tables:
-                    try:
-                        data.load_table(table)
-                        if data._spot_table is not None and not data._spot_table.empty:
-                            # Convert minute-level data to daily by resampling
-                            daily_spot = data._spot_table['spot_price'].resample('1D').last()
-                            daily_benchmark_data.append(daily_spot)
-                    except Exception as table_error:
-                        print(f"Warning: Could not load table {table}: {table_error}")
-                        continue
-                
-                data.close()  # Properly close the connection
-                
-                if daily_benchmark_data:
-                    # Concatenate all daily data
-                    benchmark_series = pd.concat(daily_benchmark_data).sort_index()
-                    # Remove duplicates if any (same dates from different tables)
-                    benchmark_series = benchmark_series[~benchmark_series.index.duplicated(keep='first')]
-                    # Calculate percentage returns for benchmark
-                    benchmark_series = benchmark_series.pct_change().dropna()
-                    benchmark_series = benchmark_series.rename("Benchmark")
-                    
-                    print(f"Created default benchmark with {len(benchmark_series)} data points")
-                    
-                else:
-                    benchmark_series = None
-                    print("No benchmark data available")
-            except Exception as e:
-                print(f"Warning: Could not create benchmark data: {e}")
-                import traceback
-                traceback.print_exc()
-                benchmark_series = None
+        # Convert equity to returns
+        equity_series = equity_df['Equity'].pct_change().dropna()
         
+        # Set up file path
         current_dir = os.getcwd()
         if output_path is None:
             tear_sheet_path = os.path.join(current_dir, filename if filename else "tearsheet.html")
         else:
-            tear_sheet_path = os.path.join(output_path, filename if filename else "tearsheet.html")
+            tear_sheet_path = output_path
 
+        # Extract trade statistics and trade table from results
+        trade_stats = results
+        trade_table = results.get('_trades', pd.DataFrame())
+        
+        # Filter by plotting date if provided
         if plotting_date is not None:
             equity_series = equity_series[equity_series.index >= plotting_date]
-            if benchmark_series is not None:
-                benchmark_series = benchmark_series[benchmark_series.index >= plotting_date]
 
-        # Enhanced trade logs - prepare detailed trade data for quantstats
-        trades_df = results['_trades']
-        
-        # Create detailed trade logs with additional information
-        detailed_trade_logs = None
-        transactions_df = None
-        
-        if not trades_df.empty:
-            detailed_trade_logs = trades_df.copy()
-            
-            # Add additional columns for better trade analysis
-            if 'EntryTag' in detailed_trade_logs.columns:
-                detailed_trade_logs['Entry_Reason'] = detailed_trade_logs['EntryTag']
-            if 'ExitTag' in detailed_trade_logs.columns:
-                detailed_trade_logs['Exit_Reason'] = detailed_trade_logs['ExitTag']
-            
-            # Calculate trade duration in days if Duration column exists
-            if 'Duration' in detailed_trade_logs.columns:
-                detailed_trade_logs['Duration_Days'] = detailed_trade_logs['Duration'].dt.days
-            
-            # Calculate win/loss ratios
-            detailed_trade_logs['Win'] = detailed_trade_logs['PnL'] > 0
-            
-            # Add trade sequence numbers
-            detailed_trade_logs['Trade_Number'] = range(1, len(detailed_trade_logs) + 1)
-            
-            # Add trade size classification (if applicable)
-            if 'PnL' in detailed_trade_logs.columns:
-                pnl_abs = detailed_trade_logs['PnL'].abs()
-                detailed_trade_logs['Trade_Size_Category'] = pd.cut(
-                    pnl_abs, 
-                    bins=3, 
-                    labels=['Small', 'Medium', 'Large']
-                )
-            
-            # Format trades for quantstats - ensure proper column names and data types
-            # QuantStats expects specific column names for trade display
-            trades_for_qs = detailed_trade_logs.copy()
-            
-            # Rename columns to match quantstats expectations
-            column_mapping = {
-                'EntryTime': 'entry_date',
-                'ExitTime': 'exit_date', 
-                'PnL': 'pnl',
-                'ReturnPct': 'return_pct',
-                'Duration': 'duration'
-            }
-            
-            # Apply column mapping
-            for old_col, new_col in column_mapping.items():
-                if old_col in trades_for_qs.columns:
-                    trades_for_qs[new_col] = trades_for_qs[old_col]
-            
-            # Ensure dates are properly formatted
-            if 'entry_date' in trades_for_qs.columns:
-                trades_for_qs['entry_date'] = pd.to_datetime(trades_for_qs['entry_date'])
-            if 'exit_date' in trades_for_qs.columns:
-                trades_for_qs['exit_date'] = pd.to_datetime(trades_for_qs['exit_date'])
-            
-            # Create transactions dataframe in the format quantstats expects
-            # This helps with displaying individual transactions
-            transactions_list = []
-            for _, trade in trades_for_qs.iterrows():
-                # Entry transaction
-                if 'entry_date' in trade and pd.notna(trade['entry_date']):
-                    transactions_list.append({
-                        'date': trade['entry_date'],
-                        'symbol': getattr(trade, 'Ticker', 'TRADE'),
-                        'qty': abs(getattr(trade, 'Size', 1)),
-                        'price': getattr(trade, 'EntryPrice', 0),
-                        'side': 'BUY' if getattr(trade, 'Size', 1) > 0 else 'SELL',
-                        'trade_num': trade.get('Trade_Number', 0)
-                    })
-                
-                # Exit transaction
-                if 'exit_date' in trade and pd.notna(trade['exit_date']):
-                    transactions_list.append({
-                        'date': trade['exit_date'],
-                        'symbol': getattr(trade, 'Ticker', 'TRADE'),
-                        'qty': abs(getattr(trade, 'Size', 1)),
-                        'price': getattr(trade, 'ExitPrice', 0),
-                        'side': 'SELL' if getattr(trade, 'Size', 1) > 0 else 'BUY',
-                        'trade_num': trade.get('Trade_Number', 0)
-                    })
-            
-            if transactions_list:
-                transactions_df = pd.DataFrame(transactions_list)
-                transactions_df['date'] = pd.to_datetime(transactions_df['date'])
-                transactions_df = transactions_df.sort_values('date')
-            
-            detailed_trade_logs = trades_for_qs
-
-        # Prepare additional parameters for quantstats
-        # Create a summary of orders/transactions for the period
-        additional_stats = {}
-        if results is not None:
-            # Add strategy information
-            additional_stats['Strategy_Name'] = getattr(results.get('_strategy'), '__class__.__name__', 'Unknown')
-            additional_stats['Total_Trades'] = len(trades_df) if not trades_df.empty else 0
-            additional_stats['Winning_Trades'] = len(trades_df[trades_df['PnL'] > 0]) if not trades_df.empty else 0
-            additional_stats['Losing_Trades'] = len(trades_df[trades_df['PnL'] <= 0]) if not trades_df.empty else 0
-            
-            if len(trades_df) > 0:
-                additional_stats['Win_Rate'] = (additional_stats['Winning_Trades'] / additional_stats['Total_Trades']) * 100
-                additional_stats['Average_Trade_PnL'] = trades_df['PnL'].mean()
-                additional_stats['Best_Trade'] = trades_df['PnL'].max()
-                additional_stats['Worst_Trade'] = trades_df['PnL'].min()
-
-        # Create a custom HTML section for trades if quantstats doesn't display them properly
-        trade_log_html = ""
-        if detailed_trade_logs is not None and not detailed_trade_logs.empty:
-            # Generate HTML table for trade logs
-            trade_log_html = self._create_trade_log_html(detailed_trade_logs)
-
-        # Final validation of benchmark before passing to quantstats
-        if benchmark_series is not None and len(benchmark_series) == 0:
-            print("Warning: Benchmark series is empty, setting to None")
-            benchmark_series = None
-        
-        print(f"Generating tearsheet with benchmark: {'Yes' if benchmark_series is not None else 'No'}")
-        if benchmark_series is not None:
-            print(f"Final benchmark series: {len(benchmark_series)} points from {benchmark_series.index.min()} to {benchmark_series.index.max()}")
-        
-        quantstats.reports.html(
-            equity_series,
-            benchmark=benchmark_series,
-            output=tear_sheet_path,
-            title=f"Strategy Tearsheet - {additional_stats.get('Strategy_Name', 'Unknown')}",
-            trades=detailed_trade_logs if detailed_trade_logs is not None else None,
-            transactions=transactions_df if transactions_df is not None else None,
-        )
-        
-        # If quantstats doesn't show trade logs properly, append them to the HTML
-        if trade_log_html and os.path.exists(tear_sheet_path):
-            self._append_trade_logs_to_html(tear_sheet_path, trade_log_html, additional_stats)
-
-        print(f"Trade logs include: {', '.join(detailed_trade_logs.columns.tolist()) if detailed_trade_logs is not None else 'No trade logs to display'}")
-        
-        # Generate detailed trade logs if requested
-        if generate_trade_logs and detailed_trade_logs is not None and not detailed_trade_logs.empty:
-            print("\nGenerating detailed trade logs...")
-            try:
-                log_files = self.generate_trade_logs(results=results, output_path=output_path, file_format='both')
-                if log_files:
-                    print(f"Trade logs generated successfully: {log_files}")
-            except Exception as e:
-                print(f"Warning: Could not generate trade logs: {e}")
-        
-        if open_browser:
-            webbrowser.open(f'file://{tear_sheet_path}')
-
-    def _create_trade_log_html(self, trades_df):
-        """Create HTML table for trade logs."""
-        if trades_df.empty:
-            return ""
-        
-        # Select key columns for display
-        display_columns = []
-        preferred_columns = [
-            'Trade_Number', 'entry_date', 'exit_date', 'Ticker', 'Size', 
-            'EntryPrice', 'ExitPrice', 'pnl', 'return_pct', 'Duration_Days',
-            'Win', 'Entry_Reason', 'Exit_Reason'
-        ]
-        
-        for col in preferred_columns:
-            if col in trades_df.columns:
-                display_columns.append(col)
-        
-        # Use available columns if preferred ones don't exist
-        if not display_columns:
-            display_columns = trades_df.columns.tolist()[:10]  # Limit to first 10 columns
-        
-        trades_display = trades_df[display_columns].copy()
-        
-        # Format the data for better display
-        for col in trades_display.columns:
-            if 'date' in col.lower() and trades_display[col].dtype == 'datetime64[ns]':
-                trades_display[col] = trades_display[col].dt.strftime('%Y-%m-%d %H:%M')
-            elif 'price' in col.lower() or 'pnl' in col.lower():
-                if trades_display[col].dtype in ['float64', 'float32']:
-                    trades_display[col] = trades_display[col].round(2)
-        
-        # Generate HTML table
-        html = f"""
-        <div class="trade-logs-section" style="margin-top: 30px;">
-            <h2 style="color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px;">
-                📋 Detailed Trade Logs
-            </h2>
-            <div style="overflow-x: auto; margin-top: 20px;">
-                {trades_display.to_html(classes='trade-logs-table', table_id='tradeLogsTable', escape=False)}
-            </div>
-        </div>
-        <style>
-        .trade-logs-table {{
-            border-collapse: collapse;
-            width: 100%;
-            font-family: Arial, sans-serif;
-            font-size: 12px;
-        }}
-        .trade-logs-table th {{
-            background-color: #4CAF50;
-            color: white;
-            padding: 12px;
-            text-align: left;
-            border: 1px solid #ddd;
-        }}
-        .trade-logs-table td {{
-            padding: 8px;
-            border: 1px solid #ddd;
-            text-align: left;
-        }}
-        .trade-logs-table tr:nth-child(even) {{
-            background-color: #f2f2f2;
-        }}
-        .trade-logs-table tr:hover {{
-            background-color: #e8f5e8;
-        }}
-        </style>
-        """
-        
-        return html
-
-    def _append_trade_logs_to_html(self, html_file_path, trade_log_html, additional_stats):
-        """Append trade logs to the existing quantstats HTML file."""
+        # Generate the tear sheet using quantstats
         try:
-            # Read the existing HTML file
-            with open(html_file_path, 'r', encoding='utf-8') as f:
-                html_content = f.read()
+            # Prepare parameters for the tear sheet
+            strategy_title = results.get('_strategy', 'Options Strategy')
             
-            # Create trade summary stats HTML
-            stats_html = ""
-            if additional_stats:
-                stats_html = f"""
-                <div class="trade-summary-section" style="margin-top: 20px; margin-bottom: 20px;">
-                    <h3 style="color: #333;">📊 Trade Summary Statistics</h3>
-                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 15px;">
-                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #4CAF50;">
-                            <strong>Total Trades:</strong> {additional_stats.get('Total_Trades', 'N/A')}
-                        </div>
-                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #2196F3;">
-                            <strong>Win Rate:</strong> {additional_stats.get('Win_Rate', 0):.1f}%
-                        </div>
-                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #FF9800;">
-                            <strong>Average Trade P&L:</strong> {additional_stats.get('Average_Trade_PnL', 0):.2f}
-                        </div>
-                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #4CAF50;">
-                            <strong>Best Trade:</strong> {additional_stats.get('Best_Trade', 0):.2f}
-                        </div>
-                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #F44336;">
-                            <strong>Worst Trade:</strong> {additional_stats.get('Worst_Trade', 0):.2f}
-                        </div>
-                        <div style="background: #f9f9f9; padding: 10px; border-left: 4px solid #9C27B0;">
-                            <strong>Winning Trades:</strong> {additional_stats.get('Winning_Trades', 0)}
-                        </div>
-                    </div>
-                </div>
-                """
+            # Extract equity curve and prepare series for quantstats
+            equity_df = results['_equity_curve']
+            equity_series = equity_df['Equity'].resample('1D').last().pct_change().dropna()
             
-            # Find the best place to insert the trade logs (before the closing body tag)
-            insertion_point = html_content.rfind('</body>')
-            if insertion_point == -1:
-                insertion_point = html_content.rfind('</html>')
-            if insertion_point == -1:
-                insertion_point = len(html_content)
+            # Check if benchmark is already provided in results, otherwise create one
+            benchmark_series = None
+            if '_benchmark' in results and results['_benchmark'] is not None:
+                benchmark_series = results['_benchmark']
+                print(f"Using provided benchmark with {len(benchmark_series)} data points")
+            else:
+                # Create a simple benchmark (buy and hold) or use None
+                try:
+                    data = _Data(self.db_path, start_date=self._start_date, end_date=self._end_date)
+                    daily_benchmark_data = []
+                    
+                    for table in data._table_names:
+                        try:
+                            data.load_table(table)
+                            if data._spot_table is not None and not data._spot_table.empty:
+                                daily_spot = data._spot_table['spot_price'].resample('1D').last()
+                                daily_benchmark_data.append(daily_spot)
+                        except Exception as table_error:
+                            print(f"Warning: Could not load table {table}: {table_error}")
+                            continue
+                    
+                    data.close()
+                    
+                    if daily_benchmark_data:
+                        benchmark_series = pd.concat(daily_benchmark_data).sort_index()
+                        benchmark_series = benchmark_series[~benchmark_series.index.duplicated(keep='first')]
+                        benchmark_series = benchmark_series.pct_change().dropna()
+                        benchmark_series = benchmark_series.rename("Benchmark")
+                        print(f"Created default benchmark with {len(benchmark_series)} data points")
+                    else:
+                        benchmark_series = None
+                        print("No benchmark data available")
+                except Exception as e:
+                    print(f"Warning: Could not create benchmark data: {e}")
+                    benchmark_series = None
             
-            # Insert the trade logs and stats
-            full_trade_section = stats_html + trade_log_html
-            new_html_content = (html_content[:insertion_point] + 
-                              full_trade_section + 
-                              html_content[insertion_point:])
+            # Get trade statistics from results
+            trade_stats = results
+            trade_table = results.get('_trades', pd.DataFrame())
             
-            # Write the updated HTML file
-            with open(html_file_path, 'w', encoding='utf-8') as f:
-                f.write(new_html_content)
-            
-            print("Trade logs successfully added to HTML tearsheet")
-            
-        except Exception as e:
-            print(f" Warning: Could not append trade logs to HTML file: {e}")
-            # Create a separate trade logs HTML file as fallback
-            trade_logs_file = html_file_path.replace('.html', '_trade_logs.html')
-            try:
-                with open(trade_logs_file, 'w', encoding='utf-8') as f:
-                    f.write(f"""
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <title>Trade Logs</title>
-                        <meta charset="utf-8">
-                    </head>
-                    <body>
-                        <h1>Trade Logs</h1>
-                        {stats_html}
-                        {trade_log_html}
-                    </body>
-                    </html>
-                    """)
-                print(f" Trade logs saved to separate file: {trade_logs_file}")
-            except Exception as e2:
-                print(f" Could not create separate trade logs file: {e2}")
-
-    def generate_trade_logs(self, *, results: pd.Series = None, output_path=None, file_format='csv'):
-        """
-        Generate detailed trade logs as separate files (CSV/Excel) for comprehensive analysis.
-        
-        Parameters:
-        - results: pd.Series, the backtest results. If None, uses the last run results.
-        - output_path: str, the directory path to save the trade logs. Default is current directory.
-        - file_format: str, format to save ('csv', 'excel', 'both'). Default is 'csv'.
-        """
-        if results is None:
-            if self._results is None:
-                raise RuntimeError('First issue `backtest.run()` to obtain results.')
-            results = self._results
-
-        trades_df = results['_trades']
-        
-        if trades_df.empty:
-            print("No trades found to generate logs.")
-            return None
-
-        # Create enhanced trade logs
-        detailed_logs = trades_df.copy()
-        
-        # Add comprehensive trade analysis columns
-        if 'EntryTime' in detailed_logs.columns and 'ExitTime' in detailed_logs.columns:
-            detailed_logs['Entry_Date'] = pd.to_datetime(detailed_logs['EntryTime']).dt.date
-            detailed_logs['Exit_Date'] = pd.to_datetime(detailed_logs['ExitTime']).dt.date
-            detailed_logs['Entry_Time'] = pd.to_datetime(detailed_logs['EntryTime']).dt.time
-            detailed_logs['Exit_Time'] = pd.to_datetime(detailed_logs['ExitTime']).dt.time
-            
-        # Add trade performance metrics
-        detailed_logs['Win'] = detailed_logs['PnL'] > 0
-        detailed_logs['Loss'] = detailed_logs['PnL'] <= 0
-        detailed_logs['Trade_Number'] = range(1, len(detailed_logs) + 1)
-        
-        # Calculate cumulative metrics
-        detailed_logs['Cumulative_PnL'] = detailed_logs['PnL'].cumsum()
-        detailed_logs['Running_Win_Rate'] = detailed_logs['Win'].expanding().mean() * 100
-        
-        # Add trade size analysis
-        if 'PnL' in detailed_logs.columns:
-            pnl_abs = detailed_logs['PnL'].abs()
-            detailed_logs['Trade_Size_Category'] = pd.cut(
-                pnl_abs, 
-                bins=3, 
-                labels=['Small', 'Medium', 'Large']
+            # Use quantstats reports.html function
+            quantstats.reports.html(
+                returns=equity_series,
+                title=f"{strategy_title} - Performance Report",
+                equity_df=equity_df,
+                benchmark=benchmark_series,
+                output=tear_sheet_path,
+                trade_stats=trade_stats,
+                trade_table=trade_table,
+                _trade_start_bar=0,  # Use 0 instead of date to avoid iloc indexing error
             )
-            
-        # Add percentage returns if possible
-        if 'EntryPrice' in detailed_logs.columns and 'ExitPrice' in detailed_logs.columns:
-            detailed_logs['Return_Pct'] = ((detailed_logs['ExitPrice'] - detailed_logs['EntryPrice']) / 
-                                         detailed_logs['EntryPrice'] * 100)
-        
-        # Add trade duration analysis
-        if 'Duration' in detailed_logs.columns:
-            detailed_logs['Duration_Days'] = detailed_logs['Duration'].dt.days
-            detailed_logs['Duration_Hours'] = detailed_logs['Duration'].dt.total_seconds() / 3600
-            
-        # Set output directory
-        current_dir = os.getcwd()
-        if output_path is None:
-            output_path = current_dir
-            
-        # Create trade logs directory if it doesn't exist
-        trade_logs_dir = os.path.join(output_path, 'trade_logs')
-        os.makedirs(trade_logs_dir, exist_ok=True)
-        
-        # Generate timestamp for unique filenames
-        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-        strategy_name = getattr(results.get('_strategy'), '__class__.__name__', 'Unknown')
-        
-        # Save files based on format preference
-        saved_files = []
-        
-        if file_format in ['csv', 'both']:
-            csv_filename = os.path.join(trade_logs_dir, f'trade_logs_{strategy_name}_{timestamp}.csv')
-            detailed_logs.to_csv(csv_filename, index=False)
-            saved_files.append(csv_filename)
-            print(f"Trade logs saved to CSV: {csv_filename}")
-        
-        if file_format in ['excel', 'both']:
-            excel_filename = os.path.join(trade_logs_dir, f'trade_logs_{strategy_name}_{timestamp}.xlsx')
-            
-            # Create Excel file with multiple sheets
-            with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
-                # Main trade logs
-                detailed_logs.to_excel(writer, sheet_name='Trade_Logs', index=False)
+            print("Tearsheet generation completed.")
+            if open_browser:
+                webbrowser.open(f'file://{tear_sheet_path}')
                 
-                # Summary statistics
-                summary_stats = self._generate_trade_summary(detailed_logs)
-                summary_stats.to_excel(writer, sheet_name='Summary_Stats', index=True)
-                
-                # Monthly/Weekly breakdown if applicable
-                if 'Entry_Date' in detailed_logs.columns:
-                    monthly_stats = self._generate_monthly_breakdown(detailed_logs)
-                    monthly_stats.to_excel(writer, sheet_name='Monthly_Breakdown', index=True)
-            
-            saved_files.append(excel_filename)
-            print(f"Trade logs saved to Excel: {excel_filename}")
-        
-        # Print summary statistics
-        print("\n=== Trade Log Summary ===")
-        print(f"Total Trades: {len(detailed_logs)}")
-        print(f"Winning Trades: {detailed_logs['Win'].sum()}")
-        print(f"Losing Trades: {detailed_logs['Loss'].sum()}")
-        print(f"Win Rate: {detailed_logs['Win'].mean() * 100:.2f}%")
-        print(f"Total PnL: {detailed_logs['PnL'].sum():.2f}")
-        print(f"Average Trade PnL: {detailed_logs['PnL'].mean():.2f}")
-        print(f"Best Trade: {detailed_logs['PnL'].max():.2f}")
-        print(f"Worst Trade: {detailed_logs['PnL'].min():.2f}")
-        
-        return saved_files
-    
-    def _generate_trade_summary(self, trades_df):
-        """Generate summary statistics from trade logs."""
-        summary = pd.Series({
-            'Total_Trades': len(trades_df),
-            'Winning_Trades': trades_df['Win'].sum(),
-            'Losing_Trades': trades_df['Loss'].sum(),
-            'Win_Rate_Pct': trades_df['Win'].mean() * 100,
-            'Total_PnL': trades_df['PnL'].sum(),
-            'Average_Trade_PnL': trades_df['PnL'].mean(),
-            'Median_Trade_PnL': trades_df['PnL'].median(),
-            'Best_Trade': trades_df['PnL'].max(),
-            'Worst_Trade': trades_df['PnL'].min(),
-            'PnL_Std_Dev': trades_df['PnL'].std(),
-            'Average_Winner': trades_df[trades_df['Win']]['PnL'].mean() if trades_df['Win'].any() else 0,
-            'Average_Loser': trades_df[trades_df['Loss']]['PnL'].mean() if trades_df['Loss'].any() else 0,
-            'Profit_Factor': (trades_df[trades_df['Win']]['PnL'].sum() / 
-                            abs(trades_df[trades_df['Loss']]['PnL'].sum())) if trades_df['Loss'].any() else float('inf'),
-        })
-        
-        if 'Duration_Days' in trades_df.columns:
-            summary['Average_Trade_Duration_Days'] = trades_df['Duration_Days'].mean()
-            summary['Median_Trade_Duration_Days'] = trades_df['Duration_Days'].median()
-        
-        return summary
-    
-    def _generate_monthly_breakdown(self, trades_df):
-        """Generate monthly breakdown of trade performance."""
-        if 'Entry_Date' not in trades_df.columns:
-            return pd.DataFrame()
-            
-        trades_df['Entry_Month'] = pd.to_datetime(trades_df['Entry_Date']).dt.to_period('M')
-        
-        monthly_stats = trades_df.groupby('Entry_Month').agg({
-            'PnL': ['count', 'sum', 'mean'],
-            'Win': ['sum', 'mean']
-        }).round(2)
-        
-        monthly_stats.columns = ['Trade_Count', 'Total_PnL', 'Avg_PnL', 'Winning_Trades', 'Win_Rate']
-        return monthly_stats
-    
-
-
+        except Exception as e:
+            print(f"Error generating tear sheet: {e}")
+            print("Available results keys:", list(results.keys()) if hasattr(results, 'keys') else "N/A")
+            import traceback
+            traceback.print_exc()
