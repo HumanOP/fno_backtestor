@@ -167,7 +167,7 @@ class _Data:
         self.consumer = QuestDBClient(endpoint)
         
     def get_ticker_data(self, ticker: str, limit: int = 1) -> Optional[bytes]:
-        query = f"SELECT * FROM {ticker} ORDER BY time DESC LIMIT {limit}"
+        query = f"SELECT * FROM {ticker} ORDER BY ts DESC LIMIT {limit}"
         try:
             return self.consumer.execute_query(query)
         except Exception as e:
