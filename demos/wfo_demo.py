@@ -214,32 +214,49 @@ if __name__ == "__main__":
     #bt.tear_sheet()
     
     #print(stats)
+
+    from core.wfo import WalkForwardOptimizer
+ 
+    wfo = WalkForwardOptimizer(
+        duckdb_path= r"FnO-Synapse\demos\nifty_1min_desiquant.duckdb",
+        strategy=IV_Slope,
+        cash=1000000,
+        legs=legs,
+        hyperparameter_grid=hyperparameter_grid,
+        start_date="2021-01-01",
+        end_date="2024-12-31",    
+        in_sample_months=4,
+        out_sample_months=2
+    )
+    
+    result = wfo.optimize()
     
 
     
-    result = bt.run_window(start_date="2021-01-01", end_date="2024-01-01", iv_slope_thresholds=params, legs=legs)
-    bt.tear_sheet()
-    print(result)
-
-    """hp = HyperParameterOptimizer(
-         db_path=db_path,
-         strategy=IV_Slope,
-         cash=10000000,
-         commission_per_contract=0.65,
-         option_multiplier=75,
-         legs=legs
-     )
+    # result = bt.run_window(start_date="2022-01-01", end_date="2022-04-30", iv_slope_thresholds=params, legs=legs)
+    # hp = HyperParameterOptimizer(
+    #     db_path=db_path,
+    #     strategy=IV_Slope,
+    #     cash=10000000,
+    #     commission_per_contract=0.65,
+    #     option_multiplier=75,
+    #     legs=legs
+    # )
 
 
-    best_params, best_sharpe, results_df = hp.optimize(
-         hyperparameter_grid=hyperparameter_grid,
-         maximize='Sharpe Ratio',
-         method='grid',
-         start_date="2022-01-01",
-         end_date="2023-04-30"
-     )
+    # best_params, best_sharpe, results_df = hp.optimize(
+    #     hyperparameter_grid=hyperparameter_grid,
+    #     maximize='Sharpe Ratio',
+    #     method='grid',
+    #     start_date="2022-01-01",
+    #     end_date="2022-04-30"
+    # )
 
-    print(f"Best Parameters: {best_params}")
-    print(f"Best Sharpe Ratio: {best_sharpe}")
-    print("Results:")
-    print(results_df)"""
+    # print(f"Best Parameters: {best_params}")
+    # print(f"Best Sharpe Ratio: {best_sharpe}")
+    # print("Results:")
+    # print(results_df)
+
+
+
+ 

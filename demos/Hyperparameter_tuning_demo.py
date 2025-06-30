@@ -201,7 +201,7 @@ if __name__ == "__main__":
 
     
     
-    bt = Backtest(
+    """bt = Backtest(
         db_path=db_path,
         strategy=IV_Slope,
         cash=10000000,
@@ -219,9 +219,9 @@ if __name__ == "__main__":
     
     result = bt.run_window(start_date="2021-01-01", end_date="2024-01-01", iv_slope_thresholds=params, legs=legs)
     bt.tear_sheet()
-    print(result)
+    print(result)"""
 
-    """hp = HyperParameterOptimizer(
+    hp = HyperParameterOptimizer(
          db_path=db_path,
          strategy=IV_Slope,
          cash=10000000,
@@ -242,4 +242,4 @@ if __name__ == "__main__":
     print(f"Best Parameters: {best_params}")
     print(f"Best Sharpe Ratio: {best_sharpe}")
     print("Results:")
-    print(results_df)"""
+    print(results_df)

@@ -6,11 +6,53 @@ import warnings
 from abc import ABC, abstractmethod
 from copy import copy
 from datetime import datetime, date as DateObject # Added DateObject
-from functools import partial # lru_cache removed
+from functools import partial, lru_cache
+from itertools import compress, product, repeat
 from math import copysign
 from numbers import Number
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 import webbrowser
+
+import numpy as np
+from numpy.random import default_rng
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+    _tqdm = partial(_tqdm, leave=False)
+except ImportError:
+    def _tqdm(seq, **_):
+        return seq
+
+# Removed conflicting quantstats imports as we have our own implementations
+
+
+
+from core.stats import compute_stats
+try:
+    # Import from local quantstats folder in FnO-Synapse workspace
+    import sys
+    import os
+    
+    # Get the path to the quantstats folder
+    current_dir = os.path.dirname(os.path.abspath(__file__))  # core directory
+    workspace_root = os.path.dirname(current_dir)  # FnO-Synapse directory
+    quantstats_path = os.path.join(workspace_root, 'quantstats')
+    
+    # Add workspace root to sys.path for importing quantstats
+    if workspace_root not in sys.path:
+        sys.path.insert(0, workspace_root)
+    
+    # Verify quantstats folder exists and import
+    if os.path.exists(quantstats_path) and os.path.isdir(quantstats_path):
+        import quantstats
+        print(f" Successfully imported local quantstats from: {quantstats_path}")
+    else:
+        raise ImportError(f"Quantstats folder not found at: {quantstats_path}")
+        
+except ImportError as e:
+    quantstats = None
+    print(f" Failed to import local quantstats: {e}")
+    warnings.warn("Local quantstats folder not found. Please ensure you're running from the FnO-Synapse directory with the quantstats folder present.")
 
 import numpy as np
 import pandas as pd
@@ -26,7 +68,7 @@ import pandas as pd
 from typing import Dict, Optional, List
 
 class _Data:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, start_date: Optional[str] = None, end_date: Optional[str] = None):
         self._conn = None
         self._table_names: List[str] = []                     # List of table names in the database
         self._ticker_map: Dict[str, pd.DataFrame] = {}        # Ticker-wise grouped data
@@ -35,6 +77,8 @@ class _Data:
         self._time: Optional[pd.Timestamp] = None
         self._spot: Optional[float] = None
         self._tte_to_expiry: Optional[Dict] = None
+        self._start_date = start_date
+        self._end_date = end_date
         self.connect_db(db_path)                              # Initialize connection and load table names
 
     def connect_db(self, db_path: str):
@@ -49,7 +93,16 @@ class _Data:
         self._spot_table = None
 
     def load_table(self, table_name: str):
-        df = self._conn.execute(f"SELECT * FROM {table_name} ORDER BY timestamp").fetchdf()
+        query = f"SELECT * FROM {table_name}"
+        conditions = []
+        if self._start_date:
+            conditions.append(f"timestamp >= '{self._start_date}'")
+        if self._end_date:
+            conditions.append(f"timestamp <= '{self._end_date}'")
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY timestamp"
+        df = self._conn.execute(query).fetchdf()
         # df["timestamp"] = df["timestamp"].dt.tz_localize("Asia/Kolkata").dt.tz_convert(None)
         # df["expiry_date"] = df["expiry_date"].dt.tz_localize("Asia/Kolkata").dt.tz_convert(None)
         self._tte_to_expiry = df.drop_duplicates("expiry_date").set_index("Time_to_expiry")["expiry_date"].to_dict()
@@ -71,6 +124,37 @@ class _Data:
             return None
         return subset_df.loc[asof_time]
 
+    def get_tables_in_date_range(self) -> List[str]:
+        """
+        Filter tables that have data within the specified date range.
+        Returns a list of table names that contain data in the date range.
+        """
+        tables_to_process = []
+        
+        print("Identifying tables in date range...")
+        for table in self._table_names:
+            try:
+                # Quick check if table has data in range
+                query = f"SELECT COUNT(*) as count FROM {table}"
+                conditions = []
+                if self._start_date:
+                    conditions.append(f"timestamp >= '{self._start_date}'")
+                if self._end_date:
+                    conditions.append(f"timestamp <= '{self._end_date}'")
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+                    
+                result = self._conn.execute(query).fetchone()
+                if result and result[0] > 0:  # Has data in date range
+                    tables_to_process.append(table)
+            except Exception as e:
+                print(f"Warning: Could not check table {table}: {e}")
+                # Add to process list anyway in case it has data
+                tables_to_process.append(table)
+        
+        print(f"Found {len(tables_to_process)} tables out of {len(self._table_names)} total tables with data in range")
+        return tables_to_process
+
     def close(self):
         self._conn.close()
 
@@ -90,7 +174,7 @@ class Strategy(ABC):
 
 
     def __repr__(self):
-        return '<Strategy ' + str(self) + '>'
+        return f'<Strategy {self.__class__.__name__}>'
     
 #   def __str__(self): not defined as in synapse
     
@@ -614,7 +698,7 @@ class _Broker:
             # Get expiry from the first trade (assume all trades for a symbol have same expiry)
             # This requires ticker to be parsable or options_data to have expiry_date
             contract_details = self.get_ticker_details(ticker)
-            if 'expiry_date' not in contract_details:
+            if contract_details is None or 'expiry_date' not in contract_details:
                 warnings.warn(f"Cannot determine expiry for {ticker}. Skipping expiration check.")
                 continue
 
@@ -648,6 +732,11 @@ class _Broker:
         for ticker in list(self.trades.keys()):
             for trade in list(self.trades.get(ticker, [])): # Iterate copy
                 last_price = self.get_ticker_last_price(ticker)
+                
+                if last_price is None:
+                    # If no price is available, use the entry price as a fallback
+                    last_price = trade.entry_price
+                    warnings.warn(f"No exit price available for {ticker}. Using entry price {last_price} for finalization.")
 
                 print(f"Finalizing trade for {ticker} at price {last_price}")
                 self._close_trade(trade, last_price, tag="EndOfTest")
@@ -720,6 +809,11 @@ class _Broker:
         assert trade.size * size_change <= 0, "size_change must be opposite or reduce existing trade size"
         assert abs(trade.size) >= abs(size_change)
 
+        # Safety check for price
+        if price is None:
+            price = trade.entry_price
+            warnings.warn(f"price is None for trade {trade.ticker}. Using entry price {price} as fallback.")
+
         size_left = trade.size + size_change # e.g. 10 + (-5) = 5
         
         # Create a "closing" trade record for the portion being closed
@@ -750,6 +844,11 @@ class _Broker:
             if not self.trades[trade.ticker]: # List is now empty
                 del self.trades[trade.ticker]
 
+        # Safety check for exec_price
+        if exec_price is None:
+            exec_price = trade.entry_price
+            warnings.warn(f"exec_price is None for trade {trade.ticker}. Using entry price {exec_price} as fallback.")
+
         trade._replace(exit_price=exec_price, exit_datetime=self.time, exit_spot=self.spot, exit_tag=tag)
         self.closed_trades.append(trade)
         # Update cash based on the realized P&L of this trade
@@ -758,6 +857,12 @@ class _Broker:
         self._cash += (trade_value - commission_cost) # Add P&L to cash
 
     def _open_trade(self, order: Order, exec_price: float):
+        # Safety check for exec_price
+        if exec_price is None:
+            warnings.warn(f"exec_price is None for order {order.ticker}. Cannot open trade. Order skipped.")
+            self.orders.remove(order)
+            return
+
         trade = Trade(self, order.strategy_id, order.position_id, order.leg_id,
                       order.ticker, order.size, exec_price, self.time, self.spot,
                       stop_loss=order.stop_loss, take_profit=order.take_profit,
@@ -792,14 +897,23 @@ class Backtest:
             option_multiplier=option_multiplier)
         self._strategy = strategy
         self._results: Optional[pd.Series] = None
+        self._start_date = None
+        self._end_date = None
 
     def run(self, **kwargs) -> pd.Series:
-        data = _Data(self.db_path)
-        data._table_names = data._table_names[90:703] # For testing, load only a few tables
+        start_date = kwargs.pop("start_date", None)
+        end_date = kwargs.pop("end_date", None)
+        self._start_date = start_date
+        self._end_date = end_date
+        data = _Data(self.db_path, start_date, end_date)
+            
+        data._table_names = data._table_names
         broker: _Broker = self._broker_factory(data=data)
         strategy: Strategy = self._strategy(broker, data, kwargs)
         processed_orders: List[Order] = []
         final_positions = None
+        equity_curve = pd.Series(dtype=float)
+        first_trade_bar = 0
 
         try:
             strategy.init()
@@ -808,10 +922,18 @@ class Backtest:
             traceback.print_exc()
             return pd.Series(name="StrategyInitError") # Return empty/error series
 
-        progress_bar = _tqdm(data._table_names, desc="Backtesting Options Strategy")
+        # Get tables that have data in the specified date range
+        tables_to_process = data.get_tables_in_date_range()
+        
+        progress_bar = _tqdm(tables_to_process, desc="Backtesting Options Strategy")
         break_outer_loop = False
-        for table in data._table_names:
+        for table in tables_to_process:
             data.load_table(table)
+            
+            # Skip if no data was loaded for this table in the date range
+            if data._spot_table is None or data._spot_table.empty:
+                progress_bar.update(1)
+                continue
 
             for row in data._spot_table.itertuples():
                 # Process each row in the spot data
@@ -828,6 +950,9 @@ class Backtest:
 
                     broker.next()  # This will call _process_orders
                     # print(f"Processed {table} in {time.time() - start:.2f} seconds at {row.Index}")
+                    equity_curve[row.Index.date()] = broker.equity()
+                    if not first_trade_bar and broker.trades:
+                        first_trade_bar = row.Index.date()
 
                 except _OutOfMoneyError:
                     print('Strategy ran out of money.')
@@ -866,8 +991,642 @@ class Backtest:
             data.close()
         
         progress_bar.close()
+        equity_curve = equity_curve.sort_index()
+        
+        stats = compute_stats(
+            orders=processed_orders,
+            trades=broker.closed_trades,
+            equity_curve=equity_curve,
+            strategy_instance=strategy,
+        )
+        stats['_trade_start_bar'] = first_trade_bar
+        
+        # Store results for tear_sheet method
+        self._results = stats
 
-        return processed_orders, final_positions, broker.closed_trades, broker.orders
+        # return processed_orders, final_positions, broker.closed_trades, broker.orders
+        return stats
     
+    def optimize(self, *,
+                 maximize: Union[str, Callable[[pd.Series], float]] = 'Sharpe Ratio',
+                 method: str = 'grid',
+                 max_tries: Optional[Union[int, float]] = None,
+                 constraint: Optional[Callable[[dict], bool]] = None,
+                 return_heatmap: bool = False,
+                 return_optimization: bool = False,
+                 random_state: Optional[int] = None,
+                 **kwargs) -> Union[pd.Series,
+                                    Tuple[pd.Series, pd.Series],
+                                    Tuple[pd.Series, pd.Series, dict]]:
+        """
+        Optimize strategy parameters to an optimal combination.
+        Returns result `pd.Series` of the best run.
 
+        `maximize` is a string key from the backtest.run()-returned results series,
+        or a function that accepts this series object and returns a number;
+        the higher the better. By default, the method maximizes
+        'Sharpe Ratio'.
 
+        `method` is the optimization method. Currently three methods are supported:
+
+        * `"grid"` which does an exhaustive (or randomized) search over the
+          cartesian product of parameter combinations,
+        * `"skopt"` which finds close-to-optimal strategy parameters using
+          [model-based optimization], making at most `max_tries` evaluations, and
+        * `"sambo"` which uses Shuffled Complex Evolution algorithm for
+          global optimization, particularly effective for complex parameter spaces.
+
+        [model-based optimization]: \
+            https://scikit-optimize.github.io/stable/auto_examples/bayesian-optimization.html
+
+        `max_tries` is the maximal number of strategy runs to perform.
+        If `method="grid"`, this results in randomized grid search.
+        If `max_tries` is a floating value between (0, 1], this sets the
+        number of runs to approximately that fraction of full grid space.
+        Alternatively, if integer, it denotes the absolute maximum number
+        of evaluations.         If unspecified (default), grid search is exhaustive,
+        whereas for `method="skopt"`, `max_tries` is set to 200,
+        and for `method="sambo"`, `max_tries` is set to 10.
+
+        `constraint` is a function that accepts a dict-like object of
+        parameters (with values) and returns `True` when the combination
+        is admissible to test with. By default, any parameters combination
+        is considered admissible.
+
+        If `return_heatmap` is `True`, besides returning the result
+        series, an additional `pd.Series` is returned with a multiindex
+        of all admissible parameter combinations, which can be further
+        inspected or projected onto 2D to plot a heatmap.
+
+        If `return_optimization` is True and `method = 'skopt'`,
+        in addition to result series (and maybe heatmap), return raw
+        [`scipy.optimize.OptimizeResult`][OptimizeResult] for further
+        inspection, e.g. with [scikit-optimize] plotting tools.
+
+        [OptimizeResult]: \
+            https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.OptimizeResult.html
+        [scikit-optimize]: https://scikit-optimize.github.io
+
+        If you want reproducible optimization results, set `random_state`
+        to a fixed integer random seed.
+
+        Additional keyword arguments represent strategy arguments with
+        list-like collections of possible values. For example, the following
+        code finds and returns the "best" of the 7 admissible (of the
+        9 possible) parameter combinations:
+
+            backtest.optimize(sma1=[5, 10, 15], sma2=[10, 20, 40],
+                              constraint=lambda p: p.sma1 < p.sma2)
+        """
+        if not kwargs:
+            raise ValueError('Need some strategy parameters to optimize')
+        
+        start_date = kwargs.pop("start_date", None)
+        end_date = kwargs.pop("end_date", None)
+
+        maximize_key = None
+        if isinstance(maximize, str):
+            maximize_key = str(maximize)
+            stats = self._results if self._results is not None else self.run()
+            if maximize not in stats:
+                raise ValueError('`maximize`, if str, must match a key in pd.Series '
+                                 'result of backtest.run()')
+
+            def maximize(stats: pd.Series, _key=maximize):
+                return stats[_key]
+
+        elif not callable(maximize):
+            raise TypeError('`maximize` must be str (a field of backtest.run() result '
+                            'Series) or a function that accepts result Series '
+                            'and returns a number; the higher the better')
+        assert callable(maximize), maximize
+
+        have_constraint = bool(constraint)
+        if constraint is None:
+
+            def constraint(_):
+                return True
+
+        elif not callable(constraint):
+            raise TypeError("`constraint` must be a function that accepts a dict "
+                            "of strategy parameters and returns a bool whether "
+                            "the combination of parameters is admissible or not")
+        assert callable(constraint), constraint
+
+        if return_optimization and method not in ['skopt', 'sambo']:
+            raise ValueError("return_optimization=True only valid if method='skopt' or method='sambo'")
+
+        def _tuple(x):
+            return x if isinstance(x, Sequence) and not isinstance(x, str) else (x,)
+
+        for k, v in kwargs.items():
+            if len(_tuple(v)) == 0:
+                raise ValueError(f"Optimization variable '{k}' is passed no "
+                                 f"optimization values: {k}={v}")
+
+        class AttrDict(dict):
+            def __getattr__(self, item):
+                return self[item]
+
+        def _grid_size():
+            size = int(np.prod([len(_tuple(v)) for v in kwargs.values()]))
+            if size < 10_000 and have_constraint:
+                size = sum(1 for p in product(*(zip(repeat(k), _tuple(v))
+                                                for k, v in kwargs.items()))
+                           if constraint(AttrDict(p)))
+            return size
+
+        def _optimize_grid() -> Union[pd.Series, Tuple[pd.Series, pd.Series]]:
+            rand = default_rng(random_state).random
+            grid_frac = (1 if max_tries is None else
+                         max_tries if 0 < max_tries <= 1 else
+                         max_tries / _grid_size())
+            param_combos = [dict(params)
+                            for params in (AttrDict(params)
+                                           for params in product(*(zip(repeat(k), _tuple(v))
+                                                                   for k, v in kwargs.items())))
+                            if constraint(params)  # type: ignore
+                            and rand() <= grid_frac]
+            if not param_combos:
+                raise ValueError('No admissible parameter combinations to test')
+
+            if len(param_combos) > 1000:
+                warnings.warn(f'Searching for best of {len(param_combos)} configurations.',
+                              stacklevel=2)
+
+            heatmap = pd.Series(np.nan,
+                                name=maximize_key,
+                                index=pd.MultiIndex.from_tuples(
+                                    [p.values() for p in param_combos],
+                                    names=next(iter(param_combos)).keys()))
+
+            # Sequential optimization - no multiprocessing
+            print(f"Running optimization on {len(param_combos)} parameter combinations...")
+            for i, params in enumerate(_tqdm(param_combos, desc='Optimizing')):
+                try:
+                    stats = self.run(start_date=start_date, end_date=end_date, **params)
+                    value = maximize(stats) 
+                    heatmap[tuple(params.values())] = value
+                    
+                    if i % 10 == 0 or i == len(param_combos) - 1:
+                        print(f"Completed {i+1}/{len(param_combos)} runs")
+                        
+                except Exception as e:
+                    print(f"Error in optimization run {i+1}: {e}")
+                    heatmap[tuple(params.values())] = np.nan
+                    continue
+            
+            # Find best parameters
+            if heatmap.isna().all():
+                # Handle case where all values in the series are NA
+                print("Warning: All optimization runs failed. Using first parameter set.")
+                stats = self.run(start_date=start_date,end_date=end_date,**param_combos[0])
+            else:
+                best_params = heatmap.idxmax(skipna=True)
+                print(f"Best parameters found: {dict(zip(heatmap.index.names, best_params))}")
+                print(f"Best score: {heatmap.max()}")
+                stats = self.run(start_date=start_date,end_date=end_date,**dict(zip(heatmap.index.names, best_params)))
+
+            if return_heatmap:
+                return stats, heatmap
+            return stats
+
+        def _optimize_skopt() -> Union[pd.Series,
+                                       Tuple[pd.Series, pd.Series],
+                                       Tuple[pd.Series, pd.Series, dict]]:
+            try:
+                from skopt import forest_minimize
+                from skopt.callbacks import DeltaXStopper
+                from skopt.learning import ExtraTreesRegressor
+                from skopt.space import Categorical, Integer, Real
+                from skopt.utils import use_named_args
+            except ImportError:
+                raise ImportError("Need package 'scikit-optimize' for method='skopt'. "
+                                  "pip install scikit-optimize") from None
+
+            nonlocal max_tries
+            max_tries = (200 if max_tries is None else
+                         max(1, int(max_tries * _grid_size())) if 0 < max_tries <= 1 else
+                         max_tries)
+
+            dimensions = []
+            for key, values in kwargs.items():
+                values = np.asarray(values)
+                if values.dtype.kind in 'mM':  # timedelta, datetime64
+                    # these dtypes are unsupported in skopt, so convert to raw int
+                    # TODO: save dtype and convert back later
+                    values = values.astype(int)
+
+                if values.dtype.kind in 'iumM':
+                    dimensions.append(Integer(low=values.min(), high=values.max(), name=key))
+                elif values.dtype.kind == 'f':
+                    dimensions.append(Real(low=values.min(), high=values.max(), name=key))
+                else:
+                    dimensions.append(Categorical(values.tolist(), name=key, transform='onehot'))
+
+            # Avoid recomputing re-evaluations:
+            # "The objective has been evaluated at this point before."
+            # https://github.com/scikit-optimize/scikit-optimize/issues/302
+            memoized_run = lru_cache()(lambda tup: self.run(start_date=start_date, end_date=end_date, **dict(tup)))
+
+            # np.inf/np.nan breaks sklearn, np.finfo(float).max breaks skopt.plots.plot_objective
+            INVALID = 1e300
+            progress = iter(_tqdm(repeat(None), total=max_tries, desc='Skopt Optimization'))
+
+            @ use_named_args(dimensions=dimensions)
+            def objective_function(**params):
+                next(progress)
+                # Check constraints
+                # TODO: Adjust after https://github.com/scikit-optimize/scikit-optimize/pull/971
+                if not constraint(AttrDict(params)):
+                    return INVALID
+                res = memoized_run(tuple(params.items()))
+                value = -maximize(res)
+                if np.isnan(value):
+                    return INVALID
+                return value
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore', 'The objective has been evaluated at this point before.')
+
+                res = forest_minimize(
+                    func=objective_function,
+                    dimensions=dimensions,
+                    n_calls=max_tries,
+                    base_estimator=ExtraTreesRegressor(n_estimators=20, min_samples_leaf=2),
+                    acq_func='LCB',
+                    kappa=3,
+                    n_initial_points=min(max_tries, 20 + 3 * len(kwargs)),
+                    initial_point_generator='lhs',  # 'sobel' requires n_initial_points ~ 2**N
+                    callback=DeltaXStopper(9e-7),
+                    random_state=random_state)
+
+            stats = self.run(start_date=start_date,end_date=end_date,**dict(zip(kwargs.keys(), res.x)))
+            output = [stats]
+
+            if return_heatmap:
+                heatmap = pd.Series(dict(zip(map(tuple, res.x_iters), -res.func_vals)),
+                                    name=maximize_key)
+                heatmap.index.names = kwargs.keys()
+                heatmap = heatmap[heatmap != -INVALID]
+                heatmap.sort_index(inplace=True)
+                output.append(heatmap)
+
+            if return_optimization:
+                valid = res.func_vals != INVALID
+                res.x_iters = list(compress(res.x_iters, valid))
+                res.func_vals = res.func_vals[valid]
+                output.append(res)
+
+            return stats if len(output) == 1 else tuple(output)
+
+        def _optimize_sambo() -> Union[pd.Series,
+                                       Tuple[pd.Series, pd.Series],
+                                       Tuple[pd.Series, pd.Series, dict]]:
+            try:
+                import sambo
+            except ImportError:
+                raise ImportError("Need package 'sambo' for method='sambo'. pip install sambo") from None
+
+            nonlocal max_tries
+            max_tries = (200 if max_tries is None else
+                         max(1, int(max_tries * _grid_size())) if 0 < max_tries <= 1 else
+                         max_tries)
+
+            dimensions = []
+            for key, values in kwargs.items():
+                values = np.asarray(_tuple(values))
+                if values.dtype.kind in 'mM':  # timedelta, datetime64
+                    # these dtypes are unsupported in SAMBO, so convert to raw int
+                    # TODO: save dtype and convert back later
+                    values = values.astype(np.int64)
+
+                if values.dtype.kind in 'iumM':
+                    dimensions.append((values.min(), values.max() + 1))
+                elif values.dtype.kind == 'f':
+                    dimensions.append((values.min(), values.max()))
+                else:
+                    dimensions.append(values.tolist())
+
+            # Avoid recomputing re-evaluations
+            @lru_cache()
+            def memoized_run(tup):
+                nonlocal maximize, self
+                stats = self.run(start_date=start_date,end_date=end_date,**dict(tup))
+                return -maximize(stats)
+
+            progress = iter(_tqdm(repeat(None), total=max_tries, leave=False,
+                                  desc='SAMBO Optimization', mininterval=2))
+            _names = tuple(kwargs.keys())
+
+            def objective_function(x):
+                nonlocal progress, memoized_run, constraint, _names
+                next(progress)
+                # Check constraints first
+                if not constraint(AttrDict(zip(_names, x))):
+                    return 1000.0  # Large penalty for constraint violations
+                value = memoized_run(tuple(zip(_names, x)))
+                return 0 if np.isnan(value) else value
+
+            def cons(x):
+                nonlocal constraint, _names
+                return constraint(AttrDict(zip(_names, x)))
+
+            res = sambo.minimize(
+                fun=objective_function,
+                bounds=dimensions,
+                constraints=cons,
+                max_iter=max_tries,
+                method='sceua',
+                rng=random_state)
+
+            stats = self.run(start_date=start_date,end_date=end_date,**dict(zip(kwargs.keys(), res.x)))
+            output = [stats]
+
+            if return_heatmap:
+                heatmap = pd.Series(dict(zip(map(tuple, res.xv), res.funv)),
+                                    name=maximize_key)
+                heatmap.index.names = kwargs.keys()
+                heatmap = -heatmap  # Convert back to maximization values (negate the minimized values)
+                heatmap.sort_index(inplace=True)
+                output.append(heatmap)
+
+            if return_optimization:
+                output.append(res)
+
+            return stats if len(output) == 1 else tuple(output)
+
+        if method == 'grid':
+            output = _optimize_grid()
+        elif method == 'skopt':
+            output = _optimize_skopt()
+        elif method == 'sambo':
+            output = _optimize_sambo()
+        else:
+            raise ValueError(f"Method should be 'grid', 'skopt', or 'sambo', not {method!r}")
+        return output
+
+    
+    def plot(self, *, results: pd.Series = None, filename=None, plot_width=None,
+             plot_equity=True, plot_return=False, plot_pl=True,
+             plot_volume=False, plot_drawdown=False, plot_trades=True,
+             smooth_equity=False, relative_equity=True,
+             superimpose: Union[bool, str] = False,
+             resample=True, reverse_indicators=False,
+             show_legend=True, open_browser=True,
+             plot_allocation=False, relative_allocation=True,
+             plot_indicator=True):
+        """
+        Plot the progression of the last backtest run.
+
+        If `results` is provided, it should be a particular result
+        `pd.Series` such as returned by
+        `Backtest.run` or `Backtest.optimize`, otherwise the last
+        run's results are used.
+
+        `filename` is the path to save the interactive HTML plot to.
+        By default, a strategy/parameter-dependent file is created in the
+        current working directory.
+
+        `plot_width` is the width of the plot in pixels. If None (default),
+        the plot is made to span 100% of browser width. The height is
+        currently non-adjustable.
+
+        If `plot_equity` is `True`, the resulting plot will contain
+        an equity (initial cash plus assets) graph section. This is the same
+        as `plot_return` plus initial 100%.
+
+        If `plot_return` is `True`, the resulting plot will contain
+        a cumulative return graph section. This is the same
+        as `plot_equity` minus initial 100%.
+
+        If `plot_pl` is `True`, the resulting plot will contain
+        a profit/loss (P/L) indicator section.
+
+        If `plot_volume` is `True`, the resulting plot will contain
+        a trade volume section.
+
+        If `plot_drawdown` is `True`, the resulting plot will contain
+        a separate drawdown graph section.
+
+        If `plot_trades` is `True`, the stretches between trade entries
+        and trade exits are marked by hash-marked tractor beams.
+
+        If `smooth_equity` is `True`, the equity graph will be
+        interpolated between fixed points at trade closing times,
+        unaffected by any interim asset volatility.
+
+        If `relative_equity` is `True`, scale and label equity graph axis
+        with return percent, not absolute cash-equivalent values.
+
+        If `superimpose` is `True`, superimpose larger-timeframe candlesticks
+        over the original candlestick chart. Default downsampling rule is:
+        monthly for daily data, daily for hourly data, hourly for minute data,
+        and minute for (sub-)second data.
+        `superimpose` can also be a valid [Pandas offset string],
+        such as `'5T'` or `'5min'`, in which case this frequency will be
+        used to superimpose.
+        Note, this only works for data with a datetime index.
+
+        If `resample` is `True`, the OHLC data is resampled in a way that
+        makes the upper number of candles for Bokeh to plot limited to 10_000.
+        This may, in situations of overabundant data,
+        improve plot's interactive performance and avoid browser's
+        `Javascript Error: Maximum call stack size exceeded` or similar.
+        Equity & dropdown curves and individual trades data is,
+        `resample` can also be a [Pandas offset string],
+        such as `'5T'` or `'5min'`, in which case this frequency will be
+        used to resample, overriding above numeric limitation.
+        Note, all this only works for data with a datetime index.
+
+        If `reverse_indicators` is `True`, the indicators below the OHLC chart
+        are plotted in reverse order of declaration.
+
+        [Pandas offset string]: \
+            https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#dateoffset-objects
+
+        If `show_legend` is `True`, the resulting plot graphs will contain
+        labeled legends.
+
+        If `open_browser` is `True`, the resulting `filename` will be
+        opened in the default web browser.
+
+        If `plot_allocation` is `True`, the resulting plot will contain
+        an equity allocation graph section. 
+
+        If `relative_allocation` is `True`, scale and label equity allocation graph axis
+        with return percent, not absolute cash-equivalent values.
+
+        If `plot_indicator` is `True`, the resulting plot will contain
+        a section for each indicator used in the strategy.
+        """
+        if results is None:
+            if self._results is None:
+                raise RuntimeError('First issue `backtest.run()` to obtain results.')
+            results = self._results
+        if quantstats is not None:
+            try:
+                # Extract equity curve for plotting
+                equity_df = results.get('_equity_curve')
+                if equity_df is not None:
+                    equity_series = equity_df['Equity']
+                    returns_series = equity_series.pct_change().dropna()
+                    
+                    # Set filename
+                    if filename is None:
+                        filename = 'backtest_plot.html'
+                    
+                    # Use quantstats plotting functionality
+                    if plot_equity:
+                        quantstats.plots.snapshot(
+                            returns_series,
+                            title=f"Backtest Results - {results.get('_strategy', 'Strategy')}",
+                            figsize=(12, 8),
+                            savefig=filename,
+                            show=open_browser
+                        )
+                        print(f"Equity plot saved to {filename}")
+                    
+                    # Additional plot options
+                    if plot_drawdown:
+                        dd_filename = filename.replace('.html', '_drawdown.html') if filename.endswith('.html') else f'{filename}_drawdown.html'
+                        quantstats.plots.drawdown(
+                            returns_series,
+                            savefig=dd_filename,
+                            show=open_browser
+                        )
+                        print(f"Drawdown plot saved to {dd_filename}")
+                    
+                    if plot_return:
+                        returns_filename = filename.replace('.html', '_returns.html') if filename.endswith('.html') else f'{filename}_returns.html'
+                        quantstats.plots.returns(
+                            returns_series,
+                            savefig=returns_filename,
+                            show=open_browser
+                        )
+                        print(f"Returns plot saved to {returns_filename}")
+                        
+                else:
+                    print("No equity curve data available for plotting")
+            except Exception as e:
+                print(f"Error generating plot: {e}")
+                print("Plotting functionality requires proper equity curve data")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("Local quantstats not available. Please ensure the quantstats folder is in your workspace.")
+
+    
+    def tear_sheet(self, *, results: pd.Series = None, plotting_date = None, filename=None, open_browser=True, output_path=None, equity_curve=False):
+        """
+        Generate a detailed tear sheet report using quantstats.
+        
+        Parameters:
+        - results: pd.Series, the backtest results. If None, uses the last run results.
+        - plotting_date: datetime, start date for plotting. If None, uses all data.
+        - filename: str, the file path to save the HTML report. Default is 'tearsheet.html'.
+        - open_browser: bool, whether to open the report in a browser. Default is True.
+        - output_path: str, the directory path to save the HTML report. Default is current directory.
+        - equity_curve: bool, whether to include backtest equity curve data.
+        """
+        if results is None:
+            if self._results is None:
+                raise RuntimeError('First issue `backtest.run()` to obtain results.')
+            results = self._results
+
+        if quantstats is None:
+            raise ImportError("quantstats is required for tear_sheet functionality. Please install quantstats.")
+
+        # Get equity data from results
+        equity_df = results.get('_equity_curve')
+        if equity_df is None:
+            raise ValueError("No equity curve data found in results. Cannot generate tear sheet.")
+        
+        # Convert equity to returns
+        equity_series = equity_df['Equity'].pct_change().dropna()
+        
+        # Set up file path
+        current_dir = os.getcwd()
+        if output_path is None:
+            tear_sheet_path = os.path.join(current_dir, filename if filename else "tearsheet.html")
+        else:
+            tear_sheet_path = output_path
+
+        # Extract trade statistics and trade table from results
+        trade_stats = results
+        trade_table = results.get('_trades', pd.DataFrame())
+        
+        # Filter by plotting date if provided
+        if plotting_date is not None:
+            equity_series = equity_series[equity_series.index >= plotting_date]
+
+        # Generate the tear sheet using quantstats
+        try:
+            # Prepare parameters for the tear sheet
+            strategy_title = results.get('_strategy', 'Options Strategy')
+            
+            # Extract equity curve and prepare series for quantstats
+            equity_df = results['_equity_curve']
+            equity_series = equity_df['Equity'].resample('1D').last().pct_change().dropna()
+            
+            # Check if benchmark is already provided in results, otherwise create one
+            benchmark_series = None
+            if '_benchmark' in results and results['_benchmark'] is not None:
+                benchmark_series = results['_benchmark']
+                print(f"Using provided benchmark with {len(benchmark_series)} data points")
+            else:
+                # Create a simple benchmark (buy and hold) or use None
+                try:
+                    data = _Data(self.db_path, start_date=self._start_date, end_date=self._end_date)
+                    daily_benchmark_data = []
+                    
+                    for table in data._table_names:
+                        try:
+                            data.load_table(table)
+                            if data._spot_table is not None and not data._spot_table.empty:
+                                daily_spot = data._spot_table['spot_price'].resample('1D').last()
+                                daily_benchmark_data.append(daily_spot)
+                        except Exception as table_error:
+                            print(f"Warning: Could not load table {table}: {table_error}")
+                            continue
+                    
+                    data.close()
+                    
+                    if daily_benchmark_data:
+                        benchmark_series = pd.concat(daily_benchmark_data).sort_index()
+                        benchmark_series = benchmark_series[~benchmark_series.index.duplicated(keep='first')]
+                        benchmark_series = benchmark_series.pct_change().dropna()
+                        benchmark_series = benchmark_series.rename("Benchmark")
+                        print(f"Created default benchmark with {len(benchmark_series)} data points")
+                    else:
+                        benchmark_series = None
+                        print("No benchmark data available")
+                except Exception as e:
+                    print(f"Warning: Could not create benchmark data: {e}")
+                    benchmark_series = None
+            
+            # Get trade statistics from results
+            trade_stats = results
+            trade_table = results.get('_trades', pd.DataFrame())
+            
+            # Use quantstats reports.html function
+            quantstats.reports.html(
+                returns=equity_series,
+                title=f"{strategy_title} - Performance Report",
+                equity_df=equity_df,
+                benchmark=benchmark_series,
+                output=tear_sheet_path,
+                trade_stats=trade_stats,
+                trade_table=trade_table,
+                _trade_start_bar=0,  # Use 0 instead of date to avoid iloc indexing error
+            )
+            print("Tearsheet generation completed.")
+            if open_browser:
+                webbrowser.open(f'file://{tear_sheet_path}')
+                
+        except Exception as e:
+            print(f"Error generating tear sheet: {e}")
+            print("Available results keys:", list(results.keys()) if hasattr(results, 'keys') else "N/A")
+            import traceback
+            traceback.print_exc()
