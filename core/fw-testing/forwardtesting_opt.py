@@ -7,28 +7,27 @@ import pandas as pd
 from typing import Dict, Optional, List
 import pandas as pd
 import time
-
-import time
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 from io import BytesIO
+from functools import partial
 
 import aiohttp
 import asyncio
-import time
 import re
 import atexit
 import threading
 
-from .live_data_fetcher import _Data, Endpoint
-from ibkr_broker_adapter import IBKRBrokerAdapter, _Broker
+from live_data_fetcher import _Data, Endpoint
+from sync_ibkr_br_adapter import _Broker
 
 class Strategy(ABC):
-    def __init__(self, broker: '_Broker', _data: _Data, params: dict):
-        self._broker: _Broker = broker
+    def __init__(self, 
+                 _broker: _Broker, 
+                 _data: _Data, 
+                 params: dict):
+        self._broker: _Broker = _broker
         self._data: _Data = _data
         self._params = self._check_params(params)
-        self._records = {}
-        self._start_on_day = 0
-
 
     def __repr__(self):
         return '<Strategy ' + str(self) + '>'
@@ -50,10 +49,7 @@ class Strategy(ABC):
 
     @abstractmethod
     def next(self):
-        """
-        Called for each spot data bar AFTER options_data for the current day is loaded.
-        Access `self.spot_data` for current spot bar.
-        Access `self.options_data` for current day's option chain.
+        """Process the next data point. This method is called on each new data point.
         """
         pass
 
@@ -62,7 +58,7 @@ class Strategy(ABC):
         position_id: str,
         leg_id: str,
         ticker: str,
-        quantity: float, # Number of contracts
+        quantity: float, # Number of lots
         stop_loss: float, take_profit: float, tag: str):
         assert quantity > 0, "Quantity for buying options must be positive"
         return self._broker.new_order(strategy_id, position_id, leg_id, ticker, quantity, stop_loss, take_profit, tag)
@@ -72,7 +68,7 @@ class Strategy(ABC):
         position_id: str,
         leg_id: str,
         ticker: str,
-        quantity: float, # Number of contracts
+        quantity: float, # Number of lots
         stop_loss: float, take_profit: float, tag: str):
         # Negative quantity for selling (to open short or close long)
         assert quantity > 0, "Quantity for selling options must be positive (use negative for broker call)"
@@ -90,58 +86,55 @@ class Strategy(ABC):
     def tte_to_expiry(self):
         return self._data._tte_to_expiry
 
-    # @property
-    # def equity(self) -> float:          # MTM of all positions
-    #     return self._broker.equity()
+    def get_ticker_data(self, ticker: str) -> Optional[pd.DataFrame]:
+        """Fetch historical data for a specific ticker contract."""
+        return self._data.get_ticker_data(ticker)
 
-    # def position(self, ticker: str) -> 'Position': # Now takes ticker
+    @property
+    def equity(self) -> float:          # MTM of all positions
+        return self._broker.equity
+    
+    @property
+    def cash(self) -> float:
+        """Get the current cash balance in the broker account."""
+        return self._broker.cash
+
+    @property
+    def orders(self):
+        return self._broker.orders
+
+    # def trades(self, ticker: str = None):
+    #     if ticker: # This property is not working as of now.
+    #         return self._broker.trades.get(ticker, [])
+    #     return self._broker.trades
+    
+    # @property
+    # def position(self, ticker: str):
     #     return self._broker.positions.get(ticker, Position(self._broker, ticker, 0)) # Return empty if not found
 
     # @property
-    # def orders(self) -> 'List[Order]':
-    #     return self._broker.orders
-
-    # # trades() and closed_trades() now refer to option trades
-    # def trades(self, ticker: str = None) -> 'Tuple[Trade, ...]':
-    #     if ticker:
-    #         return tuple(self._broker.trades.get(ticker, []))
-    #     return tuple(trade for trades_list in self._broker.trades.values() for trade in trades_list)
-    
-    # @property
     # def active_trades(self) -> 'Tuple[Trade, ...]':
     #     return tuple(trade for trades_list in self._broker.trades.values() for trade in trades_list)
-
 
     # @property
     # def closed_trades(self) -> 'Tuple[Trade, ...]':
     #     return tuple(self._broker.closed_trades)
 
 
-''' Needed features/interfaces for _Broker:
-- Order placement 
-- MTM
-- Position
-- Tradebook (update_trades)
-- Positions (update_positions)
-- Orderbook (update_orderbook)
-- Margin calculator
-- Account balance
-'''
-        
-
 class AlgoRunner:
     """Main class to run the strategy with real-time data"""
     def __init__(self, 
-                 endpoint: Endpoint, 
-                 strategy: Strategy, 
-                 broker: '_Broker',
-                 broker_creds: Optional[Dict[str, str]] = None,
+                 strategy: Type[Strategy],
+                 *,
+                 endpoint: Endpoint,
+                 broker_adapter,
+                 option_multiplier: int = 75,
                  update_interval: float = 1.0,
-                 end_time: pd.Timestamp = None):
+                 end_time: pd.Timestamp = pd.Timestamp('15:30:00')):
         self.endpoint = endpoint
-        self._strategy_class = strategy
-        self._broker_factory = broker
-        self.broker_creds = broker_creds
+        self._strategy = strategy
+        self.broker_adapter = broker_adapter
+        self.option_multiplier = option_multiplier
         self.update_interval = update_interval
         self.end_time = end_time
 
@@ -151,8 +144,8 @@ class AlgoRunner:
         
         # Initialize components
         self._data = _Data(self.endpoint)
-        self._broker = self._broker_factory(self.broker_creds)
-        self._strategy = self._strategy_class(self._broker, self._data, strategy_params)
+        self._broker = _Broker(broker_adapter=self.broker_adapter, option_multiplier= 75)
+        self._strategy = self._strategy(self._broker, self._data, strategy_params)
         
         try:
             # Initialize strategy
@@ -173,8 +166,7 @@ class AlgoRunner:
                 loop_start_time = time.time()
 
                 # Update broker state (positions, orders, etc.)
-                self._broker.update_positions()
-                self._broker.update_orders()
+                self._broker.next()
 
                 # Call strategy next() method
                 try:
@@ -184,15 +176,14 @@ class AlgoRunner:
                     traceback.print_exc()
 
                 # Check if end time reached
-                if self.end_time and time.time() >= self.end_time:
+                if self.end_time and pd.Timestamp.now() >= self.end_time:
                     print(f"End time reached: {self.end_time}")
                     self._is_running = False
-                    break
 
                 # Performance monitoring
                 loop_duration = time.time() - loop_start_time
                 if iteration_count % 10 == 0:  # Log every 10 iterations
-                    print(f"Iteration {iteration_count}: {self._data._time}, "
+                    print(f"Iteration {iteration_count}: {pd.Timestamp.now()}, "
                           f"Loop time: {loop_duration:.3f}s")
 
                 # Sleep for remaining time
@@ -202,7 +193,6 @@ class AlgoRunner:
             except KeyboardInterrupt:
                 print("Received interrupt signal, stopping...")
                 self._is_running = False
-                break
             except Exception as e:
                 print(f"Error in main loop: {e}")
                 traceback.print_exc()
@@ -219,6 +209,9 @@ class AlgoRunner:
         """Cleanup resources"""
         if self._data:
             self._data.cleanup()
+
+        if self._broker:
+            self._broker.disconnect()
         print("Cleanup completed")
 
 

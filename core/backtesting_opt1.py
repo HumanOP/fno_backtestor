@@ -86,7 +86,7 @@ class _Data:
         self._build_ticker_map(df)
         self._data_df_template = df.iloc[0:0]
         self._spot_table = df[["spot_price"]][~df.index.duplicated(keep="first")]
-        return df
+        del df  # delete this df from memory
 
     def _build_ticker_map(self, df):
         self._ticker_map = {ticker: group for ticker, group in df.groupby("ticker", sort=False)}
@@ -280,9 +280,18 @@ class Strategy(ABC):
     def tte_to_expiry(self):
         return self._data._tte_to_expiry
 
+    def get_ticker_data(self, ticker: str) -> Optional[pd.DataFrame]:
+        """Fetch historical data for a specific ticker contract."""
+        return self._data.get_ticker_data(ticker)
+
     @property
     def equity(self) -> float:
         return self._broker.equity()
+    
+    @property
+    def cash(self) -> float:
+        """Current cash available in the broker."""
+        return self._broker._cash
 
     def position(self, ticker: str) -> 'Position': # Now takes ticker
         return self._broker.positions.get(ticker, Position(self._broker, ticker, 0)) # Return empty if not found

@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import pandas as pd
-from ibkr_broker_adapter import IBKRBrokerAdapter, _Broker
+from async_ibkr_br_adapter import IBKRBrokerAdapter, _Broker
 
 async def main():
     # Configure logging

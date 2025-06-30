@@ -40,7 +40,7 @@ class IV_Slope(Strategy):
                 leg["strike"] = float(atm)
             contract = f"NIFTY{pd.Timestamp(leg['expiry']).strftime('%d%b%y').upper()}{int(leg['strike'])}{leg['type']}"
             leg["contract"] = contract
-            leg["data"] = self._data.get_ticker_data(contract)
+            leg["data"] = self.get_ticker_data(contract)
 
         missing_legs = [leg["contract"] for leg in self.legs.values() if leg["data"] is None]
         if missing_legs:
@@ -143,8 +143,11 @@ class IV_Slope(Strategy):
             if self.signal == new_signal:
                 leg_strike = self.legs["leg2"]["strike"]
                 if (self.spot * 0.99) <= leg_strike <= (self.spot * 1.01):
+                    # Case (a)
                     pass
                 else:
+                    # Case (b)
+                    # take new ATM Calendar    pass
                     placed_any_leg = False
                     for leg_id, leg in self.legs.items():
                         entry_type = self.entry_type_dict.get(leg["expiry_type"])
