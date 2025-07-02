@@ -461,6 +461,9 @@ class Trade:
         self.__entry_price = entry_price
         self.__entry_datetime = entry_datetime
         self.__entry_spot = entry_spot
+        self.__pl = 0 
+        self.__pl_pct = 0 
+        self.__value = 0
         self.__stop_loss = stop_loss
         self.__take_profit = take_profit
         self.__entry_tag = entry_tag
@@ -532,43 +535,52 @@ class Trade:
 
     @property
     def pl(self):
-        """Trade profit (positive) or loss (negative) in cash units."""
-        if self.__exit_price is None: # Mark-to-market P&L for open trade
-            current_ticker_price = self.__broker.get_ticker_last_price(self.__ticker)
-            if current_ticker_price is None: return 0 # Not in current chain / no price
-            price_diff = current_ticker_price - self.__entry_price
-        else: # Realized P&L for closed trade
-            price_diff = self.__exit_price - self.__entry_price
+        return self.__pl 
 
-        return self.__size * price_diff * self.__broker._option_multiplier
+    @setattr
+    def set_pl(self,pl):
+        self.__pl=pl
 
     @property
     def pl_pct(self):
-        """Trade profit (positive) or loss (negative) in percent of initial premium paid/received."""
-        if self.__entry_price == 0: return np.nan # Avoid division by zero
+        return self.__pl_pct 
 
-        if self.__exit_price is None:
-            current_ticker_price = self.__broker.get_ticker_last_price(self.__ticker)
-            if current_ticker_price is None: return np.nan
-            price_diff = current_ticker_price - self.__entry_price
-        else:
-            price_diff = self.__exit_price - self.__entry_price
-
-        # For longs, pl_pct = price_diff / entry_price
-        # For shorts, pl_pct = -price_diff / entry_price (since entry_price was received)
-        # Simpler: (pnl / (abs(size) * entry_price * multiplier))
-        initial_value_per_contract = self.__entry_price
-        pnl_per_contract = price_diff * copysign(1, self.__size) # To align with P&L direction
+    @setattr
+    def set_pl_pct(self,pl):
+        self.__pl_pct=pl
         
-        return pnl_per_contract / initial_value_per_contract if initial_value_per_contract else np.nan
+
+    
+    # @property
+    # def pl_pct(self):
+
+    #     """Trade profit (positive) or loss (negative) in percent of initial premium paid/received."""
+    #     if self.__entry_price == 0: return np.nan # Avoid division by zero
+
+    #     if self.__exit_price is None:
+    #         current_ticker_price = self.__broker.get_ticker_last_price(self.__ticker)
+    #         if current_ticker_price is None: return np.nan
+    #         price_diff = current_ticker_price - self.__entry_price
+    #     else:
+    #         price_diff = self.__exit_price - self.__entry_price
+
+    #     # For longs, pl_pct = price_diff / entry_price
+    #     # For shorts, pl_pct = -price_diff / entry_price (since entry_price was received)
+    #     # Simpler: (pnl / (abs(size) * entry_price * multiplier))
+    #     initial_value_per_contract = self.__entry_price
+    #     pnl_per_contract = price_diff * copysign(1, self.__size) # To align with P&L direction
+        
+    #     return pnl_per_contract / initial_value_per_contract if initial_value_per_contract else np.nan
 
 
     @property
     def value(self):
-        """Trade current market value in cash (contracts * price * multiplier)."""
-        price = self.__exit_price or self.__broker.get_ticker_last_price(self.__ticker)
-        if price is None: return 0 # No current price available
-        return self.__size * price * self.__broker._option_multiplier
+        return self.__value
+       
+
+    @setattr
+    def setvalue(self,val):
+        self.__value=val
 
 
 class _Broker:
@@ -753,7 +765,8 @@ class _Broker:
     # @profile
     def next(self): # Called for each spot bar
         self._process_orders()
-
+        self._process_trades()
+     
         # Log equity
         self._equity[self.time] = self.equity()
 
@@ -769,6 +782,7 @@ class _Broker:
                 raise _OutOfMoneyError
         
 
+    
     def _process_orders(self):
 
         for order in list(self.orders): # Iterate a copy
@@ -808,6 +822,33 @@ class _Broker:
                     self._open_trade(order, exec_price)
                 else: # If part of an existing trade, update the trade
                     self._reduce_trade(order, exec_price)
+
+    def _process_trades(self):
+        for trade in self.trades:
+            current_ticker_price=None
+            ''' for pnl '''
+            if trade.exit_price is None: # Mark-to-market P&L for open trade
+                current_ticker_price = self.get_ticker_last_price(trade.ticker)
+                if current_ticker_price is None: # Not in current chain / no price
+                    trade.set_pl(0)
+                    trade.set_pl_pct(0)
+                    trade.set_value(0)
+                    continue
+                price_diff = current_ticker_price - trade.entry_price
+            else: # Realized P&L for closed trade
+                price_diff = trade.exit_price - trade.entry_price
+
+            trade.set_pl(trade.size * price_diff * self._option_multiplier)
+
+            # this is for pnl percentage
+            initial_value_per_contract = trade.entry_price
+            pnl_per_contract = price_diff * copysign(1, trade.size) # To align with P&L direction
+            trade.set_pl_pct(pnl_per_contract / initial_value_per_contract if initial_value_per_contract else np.nan)
+
+            #this for trade value
+            trade.set_value(trade.size * current_ticker_price * self._option_multiplier)
+           
+
 
     def _reduce_trade(self, order: Order, price: float):
         # size_change is the amount by which the trade's size is changing.

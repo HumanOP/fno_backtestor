@@ -8,9 +8,12 @@ import pandas as pd
 from typing import Dict, Optional, List, Any
 import time
 import logging
+from math import copysign
+import numpy as np
 # from core.backtesting_opt import Trade, Order, Position
 from live_data_fetcher import _Data, Endpoint, QuestDBClient
 from ib_async import IB, Contract, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, Order, Fill
+from core.backtesting_opt import Order,Trade,Position
 import pytz
 
 class IBKRBrokerAdapter:
@@ -281,7 +284,7 @@ class IBKRBrokerAdapter:
 
 class _Broker:
     """Synchronous broker class for easier usage."""   
-    def __init__(self, *, broker_adapter, option_multiplier: int):
+    def __init__(self, *, broker_adapter, option_multiplier: int,data:_Data):
         """Initialize the broker with broker adapter only."""
         assert option_multiplier > 0, "option_multiplier must be positive"
         assert broker_adapter is not None, "broker adapter must be provided"
@@ -289,10 +292,19 @@ class _Broker:
         logging.basicConfig(filename='broker_log.txt', level=logging.INFO)
         self._adapter = broker_adapter
         self._option_multiplier = option_multiplier
-        self.orders: List[Dict[str, Any]] = []
-        self.trades: List[Dict[str, Any]] = []
-        self.closed_trades: List[Dict[str, Any]] = []
-        self.positions: List[Dict[str, Any]] = []
+        self._data=data
+
+        # These are the adapter books
+        self.orderbook: List[Dict[str, Any]] = []
+        self.tradebook: List[Dict[str, Any]] = []
+        self.positionbook: List[Dict[str, Any]] = []
+
+        # These are the internal books
+        self.orders: List[Order] = []
+        self.trades: Dict[str, List[Trade]] = {}
+        self.closed_trades: List[Trade] = []
+        self.positions: Dict[str, Position] = {} # Updated as trades occur
+
         self.equity: float = 0.0
         self.cash: float = 0.0
         self._broker_orders: Dict[Any, Order] = {}  # Map broker order ID to local Order
@@ -347,10 +359,197 @@ class _Broker:
 
     def next(self):
         """Process next market data update by fetching latest broker data."""
+        self._process_orders()
+        self._process_trades()
+
         self.update_account_info()
         self.update_positions()
         self.update_orders()
         self.update_trades()
+
+    
+    
+    def get_ticker_execution_price(self, ticker: str, is_buy_order: bool) -> Optional[float]:
+        """
+        Determines execution price for an option.
+        Simple logic: if limit, use limit if marketable. Else, use 'Last' or 'Mid'.
+        A real system uses NBBO and considers liquidity.
+        """
+        ticker_data = self._data.get_ticker_data(ticker)
+        if ticker_data is None:
+            # warnings.warn(f"No data for option {ticker} in current chain. Order cannot fill.")
+            return None
+
+        # Prioritize 'Last', then 'Ask' for buy, 'Bid' for sell, then calculated Mid
+        fill_price = None
+        last_price = ticker_data.get('close')
+        ask_price = ticker_data.get('Ask')
+        bid_price = ticker_data.get('Bid')
+
+        if is_buy_order:
+            market_price = None
+            if pd.notna(ask_price) and ask_price > 0: market_price = ask_price
+            elif pd.notna(last_price) and last_price > 0 : market_price = last_price
+            elif pd.notna(bid_price) and bid_price > 0: market_price = bid_price # Less likely fill for buy
+            fill_price = market_price
+        else: # Sell order
+            market_price = None
+            if pd.notna(bid_price) and bid_price > 0: market_price = bid_price
+            elif pd.notna(last_price) and last_price > 0: market_price = last_price
+            elif pd.notna(ask_price) and ask_price > 0: market_price = ask_price # Less likely fill for sell
+            fill_price = market_price
+        
+        return fill_price if pd.notna(fill_price) and fill_price > 0 else None
+    
+    def _process_orders(self):
+
+        for order in list(self.orders): # Iterate a copy
+            if order not in self.orders: continue # Already processed/canceled
+
+            
+            exec_price = self.get_ticker_execution_price(order.ticker, order.is_long)
+            print(f"exec_price: {exec_price}, order: {order.ticker}, size: {order.size}")
+
+            if exec_price is None:
+           
+                continue
+
+        
+            trade_value = exec_price * order.size * self._option_multiplier
+            commission_cost = 0.65 * abs(order.size) # comission hardcoded
+
+  
+            if order.is_long: # Buying an option
+                required_cash = abs(trade_value) + commission_cost
+                if self._cash < required_cash:
+                    warnings.warn(f"Not enough cash for {order}. Has {self._cash:.2f}, needs {required_cash:.2f}. Order skipped.")
+                    self.orders.remove(order)
+                    continue
+        
+            
+            if order.size != 0: # If any part of the order remains to be opened
+                if order.trade == None: # If not part of an existing trade
+                    # Open a new trade
+                    self._open_trade(order, exec_price)
+                else: # If part of an existing trade, update the trade
+                    self._reduce_trade(order, exec_price)
+
+    def _open_trade(self, order: Order, exec_price: float):
+
+        if exec_price is None:
+            warnings.warn(f"exec_price is None for order {order.ticker}. Cannot open trade. Order skipped.")
+            self.orders.remove(order)
+            return
+
+        trade = Trade(self, order.strategy_id, order.position_id, order.leg_id,
+                      order.ticker, order.size, exec_price, self.time, self.spot,
+                      stop_loss=order.stop_loss, take_profit=order.take_profit,
+                      entry_tag=order.tag)
+        if order.ticker not in self.trades:
+            self.trades[order.ticker] = []
+        self.trades[order.ticker].append(trade)
+        trade_value = trade.size * exec_price * self._option_multiplier
+        commission_cost = 0.65 * abs(trade.size) # commision is fixed for now
+        self._cash -= (trade_value + commission_cost)
+
+        if order.ticker not in self.positions:
+            self.positions[order.ticker] = Position(self, order.ticker)
+        # Position object will query self.trades for its size/pl dynamically
+        self.orders.remove(order) # Order processed
+
+    def _reduce_trade(self, order: Order, price: float):
+        # size_change is the amount by which the trade's size is changing.
+        # e.g., trade.size = 10 (long), size_change = -5 (closing 5 contracts) -> new size = 5
+        # e.g., trade.size = 10 (long), size_change = -10 (closing all) -> new size = 0
+        trade = order.trade
+        size_change = order.size # This is the amount to reduce the trade by
+        assert trade.size * size_change <= 0, "size_change must be opposite or reduce existing trade size"
+        assert abs(trade.size) >= abs(size_change)
+
+        # Safety check for price
+        if price is None:
+            price = trade.entry_price
+            warnings.warn(f"price is None for trade {trade.ticker}. Using entry price {price} as fallback.")
+
+        size_left = trade.size + size_change # e.g. 10 + (-5) = 5
+        
+        # Create a "closing" trade record for the portion being closed
+        closed_portion_trade = trade._copy(
+            size=-size_change, # The amount that was actually transacted to reduce
+            exit_price=price,
+            exit_datetime=self.time,
+            exit_spot=self.spot,
+            exit_tag=order.tag or "Partial Close" # Use order tag if available
+        )
+        # Update P&L for broker's cash based on this realized portion
+
+        if size_left == 0: # Trade is fully closed
+            self._close_trade(trade, price, order.tag)
+        else: # Trade is partially closed
+            trade._replace(size=size_left)
+            # Add the record of the closed portion
+            self.closed_trades.append(closed_portion_trade)
+            trade_value = closed_portion_trade.size * price * self._option_multiplier
+            commission_cost = 0.65 * abs(closed_portion_trade.size) # commision is fixed
+            self._cash += (trade_value - commission_cost) # Add P&L to cash
+        
+        self.orders.remove(order) # Order processed
+
+    def _close_trade(self, trade: Trade, exec_price: float, tag: str = "Closed"):
+        if trade in self.trades.get(trade.ticker, []):
+            self.trades[trade.ticker].remove(trade)
+            if not self.trades[trade.ticker]: # List is now empty
+                del self.trades[trade.ticker]
+
+        # Safety check for exec_price
+        if exec_price is None:
+            exec_price = trade.entry_price
+            warnings.warn(f"exec_price is None for trade {trade.ticker}. Using entry price {exec_price} as fallback.")
+
+        trade._replace(exit_price=exec_price, exit_datetime=self.time, exit_spot=self.spot, exit_tag=tag)
+        self.closed_trades.append(trade)
+        # Update cash based on the realized P&L of this trade
+        trade_value = trade.size * exec_price * self._option_multiplier
+        commission_cost = 0.65 * abs(trade.size) # commision is fixed fornow
+        self._cash += (trade_value - commission_cost) # Add P&L to cash
+
+    def get_ticker_last_price(self,ticker):
+        ticker_data = self._data.get_ticker_data(ticker)
+        if ticker_data is None:
+            # warnings.warn(f"No data for option {ticker} in current chain. Order cannot fill.")
+            return None
+
+      
+        last_price = ticker_data.get('close')
+        if last_price!=None:
+            return last_price
+      
+
+
+    def _process_trades(self):
+        for trade in self.trades:
+            current_ticker_price=None
+            ''' for pnl '''
+            if trade.exit_price is None: # Mark-to-market P&L for open trade
+                current_ticker_price = self.get_ticker_last_price(trade.ticker)
+                if current_ticker_price is None: # Not in current chain / no price
+                    trade.set_pl(0)
+                    trade.set_pl_pct(0)
+                    trade.set_value(0)
+                    continue
+                price_diff = current_ticker_price - trade.entry_price
+            else: # Realized P&L for closed trade
+                price_diff = trade.exit_price - trade.entry_price
+
+            trade.set_pl(trade.size * price_diff * self._option_multiplier)
+
+            # this is for pnl percentage
+            initial_value_per_contract = trade.entry_price
+            pnl_per_contract = price_diff * copysign(1, trade.size) # To align with P&L direction
+            trade.set_pl_pct(pnl_per_contract / initial_value_per_contract if initial_value_per_contract else np.nan)
+
+            #this for trade value
+            trade.set_value(trade.size * current_ticker_price * self._option_multiplier)
 
     def is_market_open(self) -> bool:
         """Check if the market is open (NSE hours)."""
@@ -363,6 +562,12 @@ class _Broker:
     def new_order(self, ticker: str, action: str, quantity: float, order_type: str = "MARKET", order_params: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Place an order with the broker."""
         order_id = self._adapter.place_order(ticker, action, quantity, order_type, order_params)
+        # assert size != 0, "Order size must be non-zero"
+
+        # order = Order(self, strategy_id, position_id, leg_id, ticker, size,
+        #               stop_loss=stop_loss, take_profit=take_profit, tag=tag, trade=trade)
+
+        # self.orders.append(order)
         return order_id
     
     def margin_impact(self, ticker: str, action: str, quantity: float) -> Optional[float]:
@@ -461,7 +666,7 @@ if __name__ == "__main__":
     # Initialize the IBKR adapter
     ibkr_adapter = IBKRBrokerAdapter(host='localhost', port=7497, client_id=1)
     try:
-        broker = _Broker(option_multiplier=1, broker_adapter=ibkr_adapter)
+        broker = _Broker(option_multiplier=1, broker_adapter=ibkr_adapter,data=fetcher)
         
         broker.next()
 
