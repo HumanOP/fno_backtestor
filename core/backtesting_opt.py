@@ -165,7 +165,7 @@ class _Data:
 
 
 class Strategy(ABC):
-    def __init__(self, broker: '_Broker', _data: _Data, params: dict):
+    def __init__(self, broker, _data: _Data, params: dict):
         self._broker: _Broker = broker
         self._data: _Data = _data
         self._params = self._check_params(params)
@@ -295,7 +295,7 @@ class Strategy(ABC):
     
 
 class Position:
-    def __init__(self, broker: '_Broker', ticker: str, initial_size: float = 0): # Added initial_size
+    def __init__(self, broker, ticker: str, initial_size: float = 0): # Added initial_size
         self.__broker = broker
         self.__ticker = ticker
         # Position size is now managed directly by summing trades in _Broker,
@@ -358,7 +358,7 @@ class _OutOfMoneyError(Exception):
 
 
 class Order:
-    def __init__(self, broker: '_Broker', strategy_id: str, position_id: str, leg_id: str,
+    def __init__(self, broker, strategy_id: str, position_id: str, leg_id: str,
                  ticker: str, # Changed from ticker
                  size: float, # Number of contracts
                  stop_loss: float = None, take_profit: float = None,
@@ -448,7 +448,7 @@ class Order:
 
 
 class Trade:
-    def __init__(self, broker: '_Broker', strategy_id: str, position_id: str, leg_id: str,
+    def __init__(self, broker, strategy_id: str, position_id: str, leg_id: str,
                  ticker: str, size: int, entry_price: float, entry_datetime: pd.Timestamp,
                  entry_spot: float, stop_loss: float = None, take_profit: float = None, entry_tag: str = None):
 
@@ -599,7 +599,7 @@ class _Broker:
         self._commission_per_contract = commission_per_contract
         self._option_multiplier = option_multiplier
 
-        self.orders: List[Order] = []
+        self.orders: List[Order] = [] # this is pending orders
         self.trades: Dict[str, List[Trade]] = {}
         self.closed_trades: List[Trade] = []
         self.positions: Dict[str, Position] = {} # Updated as trades occur

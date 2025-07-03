@@ -300,10 +300,12 @@ class _Broker:
         self.positionbook: List[Dict[str, Any]] = []
 
         # These are the internal books
-        self.orders: List[Order] = []
+        self.orders: List[Order] = [] # these are loose  orders by STRATEGY
         self.trades: Dict[str, List[Trade]] = {}
         self.closed_trades: List[Trade] = []
         self.positions: Dict[str, Position] = {} # Updated as trades occur
+
+        self.active_order_ids={}
 
         self.equity: float = 0.0
         self.cash: float = 0.0
@@ -319,7 +321,14 @@ class _Broker:
         
         # Initialize account info
         self.update_account_info()
-     
+    @property
+    def time(self): # Current spot data timestamp
+        return self._data._time
+    
+    @property
+    def spot(self) -> float:
+        return self._data._spot
+    
     def __repr__(self):
         active_trades = sum(len(ts) for ts in self.trades.values())
         return f'<Broker: Cash={self.cash:.2f}, Equity={self.equity:.2f} ({active_trades} open trades)>'
@@ -359,10 +368,11 @@ class _Broker:
 
     def next(self):
         """Process next market data update by fetching latest broker data."""
+        self.on_order_fill()
         self._process_orders()
         self._process_trades()
 
-        self.update_account_info()
+        # self.update_account_info()
         self.update_positions()
         self.update_orders()
         self.update_trades()
@@ -404,60 +414,36 @@ class _Broker:
     def _process_orders(self):
 
         for order in list(self.orders): # Iterate a copy
-            if order not in self.orders: continue # Already processed/canceled
-
-            
-            exec_price = self.get_ticker_execution_price(order.ticker, order.is_long)
-            print(f"exec_price: {exec_price}, order: {order.ticker}, size: {order.size}")
-
-            if exec_price is None:
-           
-                continue
-
-        
-            trade_value = exec_price * order.size * self._option_multiplier
-            commission_cost = 0.65 * abs(order.size) # comission hardcoded
-
   
-            if order.is_long: # Buying an option
-                required_cash = abs(trade_value) + commission_cost
-                if self._cash < required_cash:
-                    warnings.warn(f"Not enough cash for {order}. Has {self._cash:.2f}, needs {required_cash:.2f}. Order skipped.")
-                    self.orders.remove(order)
-                    continue
-        
+            
+
+         
+            required_margin=self.margin_impact(order.ticker,action,order.size)
+            if self._cash < required_margin:
+                warnings.warn(f"Not enough cash for {order}. Has {self._cash:.2f}, needs {required_margin:.2f}. Order skipped.")
+                self.orders.remove(order)
+                continue
             
             if order.size != 0: # If any part of the order remains to be opened
                 if order.trade == None: # If not part of an existing trade
                     # Open a new trade
-                    self._open_trade(order, exec_price)
+                    self._open_trade(order)
                 else: # If part of an existing trade, update the trade
-                    self._reduce_trade(order, exec_price)
+                    self._reduce_trade(order)
+        
+        
 
-    def _open_trade(self, order: Order, exec_price: float):
 
-        if exec_price is None:
-            warnings.warn(f"exec_price is None for order {order.ticker}. Cannot open trade. Order skipped.")
-            self.orders.remove(order)
-            return
+    def _open_trade(self, order: Order):
 
-        trade = Trade(self, order.strategy_id, order.position_id, order.leg_id,
-                      order.ticker, order.size, exec_price, self.time, self.spot,
-                      stop_loss=order.stop_loss, take_profit=order.take_profit,
-                      entry_tag=order.tag)
-        if order.ticker not in self.trades:
-            self.trades[order.ticker] = []
-        self.trades[order.ticker].append(trade)
-        trade_value = trade.size * exec_price * self._option_multiplier
-        commission_cost = 0.65 * abs(trade.size) # commision is fixed for now
-        self._cash -= (trade_value + commission_cost)
+        action="BUY" if order.size > 0 else "SELL"
+        order_id=self._adapter.place_order(order.ticker, action, order.size, order.tag)
+        self.active_order_ids[order_id]=order
 
-        if order.ticker not in self.positions:
-            self.positions[order.ticker] = Position(self, order.ticker)
-        # Position object will query self.trades for its size/pl dynamically
+
         self.orders.remove(order) # Order processed
 
-    def _reduce_trade(self, order: Order, price: float):
+    def _reduce_trade(self, order: Order):
         # size_change is the amount by which the trade's size is changing.
         # e.g., trade.size = 10 (long), size_change = -5 (closing 5 contracts) -> new size = 5
         # e.g., trade.size = 10 (long), size_change = -10 (closing all) -> new size = 0
@@ -466,17 +452,14 @@ class _Broker:
         assert trade.size * size_change <= 0, "size_change must be opposite or reduce existing trade size"
         assert abs(trade.size) >= abs(size_change)
 
-        # Safety check for price
-        if price is None:
-            price = trade.entry_price
-            warnings.warn(f"price is None for trade {trade.ticker}. Using entry price {price} as fallback.")
+       
+       
 
         size_left = trade.size + size_change # e.g. 10 + (-5) = 5
         
         # Create a "closing" trade record for the portion being closed
         closed_portion_trade = trade._copy(
             size=-size_change, # The amount that was actually transacted to reduce
-            exit_price=price,
             exit_datetime=self.time,
             exit_spot=self.spot,
             exit_tag=order.tag or "Partial Close" # Use order tag if available
@@ -489,12 +472,13 @@ class _Broker:
             trade._replace(size=size_left)
             # Add the record of the closed portion
             self.closed_trades.append(closed_portion_trade)
-            trade_value = closed_portion_trade.size * price * self._option_multiplier
-            commission_cost = 0.65 * abs(closed_portion_trade.size) # commision is fixed
-            self._cash += (trade_value - commission_cost) # Add P&L to cash
+            # trade_value = closed_portion_trade.size * price * self._option_multiplier
+            # commission_cost = 0.65 * abs(closed_portion_trade.size) # commision is fixed
+            # self._cash += (trade_value - commission_cost) # Add P&L to cash
         
         self.orders.remove(order) # Order processed
-
+    
+    
     def _close_trade(self, trade: Trade, exec_price: float, tag: str = "Closed"):
         if trade in self.trades.get(trade.ticker, []):
             self.trades[trade.ticker].remove(trade)
@@ -509,9 +493,9 @@ class _Broker:
         trade._replace(exit_price=exec_price, exit_datetime=self.time, exit_spot=self.spot, exit_tag=tag)
         self.closed_trades.append(trade)
         # Update cash based on the realized P&L of this trade
-        trade_value = trade.size * exec_price * self._option_multiplier
-        commission_cost = 0.65 * abs(trade.size) # commision is fixed fornow
-        self._cash += (trade_value - commission_cost) # Add P&L to cash
+        # trade_value = trade.size * exec_price * self._option_multiplier
+        # commission_cost = 0.65 * abs(trade.size) # commision is fixed fornow
+        # self._cash += (trade_value - commission_cost) # Add P&L to cash
 
     def get_ticker_last_price(self,ticker):
         ticker_data = self._data.get_ticker_data(ticker)
@@ -559,16 +543,24 @@ class _Broker:
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
         return market_open <= now <= market_close
 
-    def new_order(self, ticker: str, action: str, quantity: float, order_type: str = "MARKET", order_params: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        """Place an order with the broker."""
-        order_id = self._adapter.place_order(ticker, action, quantity, order_type, order_params)
-        # assert size != 0, "Order size must be non-zero"
+    # def new_order(self, ticker: str, action: str, quantity: float, order_type: str = "MARKET", order_params: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    #     """Place an order with the broker."""
+    #     order_id = self._adapter.place_order(ticker, action, quantity, order_type, order_params)
+        
+    #     return order_id
+    
+    def new_order(self, strategy_id: str, position_id: str, leg_id: str,
+                  ticker: str,
+                  size: float, # Number of contracts
+                  stop_loss: float = None, take_profit: float = None,
+                  tag: object = None, trade: Trade = None) -> Order:
+        assert size != 0, "Order size must be non-zero"
 
-        # order = Order(self, strategy_id, position_id, leg_id, ticker, size,
-        #               stop_loss=stop_loss, take_profit=take_profit, tag=tag, trade=trade)
+        order = Order(self, strategy_id, position_id, leg_id, ticker, size,
+                      stop_loss=stop_loss, take_profit=take_profit, tag=tag, trade=trade)
 
-        # self.orders.append(order)
-        return order_id
+        self.orders.append(order)
+        return order
     
     def margin_impact(self, ticker: str, action: str, quantity: float) -> Optional[float]:
         """Calculate margin impact of an order."""
@@ -602,33 +594,50 @@ class _Broker:
             logging.error(f"Error closing positions: {str(e)}")
             return []
 
-    def on_order_fill(self, order_id: Any, quantity: float, price: float, ticker: str) -> None:
-        """Handle order fill events."""
-        order = self._broker_orders.get(order_id)
-        if not order:
-            logging.warning(f"No local order found for broker order ID {order_id}")
-            return
-        try:
-            if order.trade is None:
-                trade = Trade(
-                    self, order.strategy_id, order.position_id, order.leg_id, ticker, order.size,
-                    price, pd.Timestamp.now(), None, order.stop_loss, order.take_profit, order.tag
-                )
-                if ticker not in self.trades:
-                    self.trades[ticker] = []
-                self.trades[ticker].append(trade)
-            else:
-                order.trade._replace(
-                    exit_price=price, exit_datetime=pd.Timestamp.now(), exit_spot=None, exit_tag="FILLED"
-                )
-                if order.trade.size == 0:
-                    self.trades[ticker].remove(order.trade)
-                    self.closed_trades.append(order.trade)
-            self.orders.remove(order)
-            del self._broker_orders[order_id]
-            logging.info(f"Order filled: {ticker}, Quantity: {quantity}, Price: {price}, Order ID: {order_id}")
-        except Exception as e:
-            logging.error(f"Error processing order fill for {ticker}: {str(e)}")
+    def on_order_fill(self) -> None:
+        
+        for order_id,order in self.active_order_ids:
+            price=self.get_ticker_last_price(ticker=order.ticker) # NOT CORRECT ----- (this price we will get from ibkr's some function)
+          
+            for trade in self._adapter.get_trades():
+                if trade['order']==order_id and trade['orderStatus']=='Filled': # NOT CORRECT ------- ( need toimplement the order id)
+                    br_trade = Trade(
+                        self, order.strategy_id, order.position_id, order.leg_id, order.ticker, order.size,
+                        price, pd.Timestamp.now(), None, order.stop_loss, order.take_profit, order.tag)
+                    self.trades[order.ticker].append(br_trade)
+                    order.trade=br_trade
+                    if order.ticker not in self.positions:
+                        self.positions[order.ticker] = Position(self, order.ticker)
+                    self.active_order_ids.pop(order_id)
+          
+
+        
+        # """Handle order fill events."""
+        # order = self._broker_orders.get(order_id)
+        # if not order:
+        #     logging.warning(f"No local order found for broker order ID {order_id}")
+        #     return
+        # try:
+        #     if order.trade is None:
+        #         trade = Trade(
+        #             self, order.strategy_id, order.position_id, order.leg_id, ticker, order.size,
+        #             price, pd.Timestamp.now(), None, order.stop_loss, order.take_profit, order.tag
+        #         )
+        #         if ticker not in self.trades:
+        #             self.trades[ticker] = []
+        #         self.trades[ticker].append(trade)
+        #     else:
+        #         order.trade._replace(
+        #             exit_price=price, exit_datetime=pd.Timestamp.now(), exit_spot=None, exit_tag="FILLED"
+        #         )
+        #         if order.trade.size == 0:
+        #             self.trades[ticker].remove(order.trade)
+        #             self.closed_trades.append(order.trade)
+        #     self.orders.remove(order)
+        #     del self._broker_orders[order_id]
+        #     logging.info(f"Order filled: {ticker}, Quantity: {quantity}, Price: {price}, Order ID: {order_id}")
+        # except Exception as e:
+        #     logging.error(f"Error processing order fill for {ticker}: {str(e)}")
 
     def cancel_all_orders(self) -> None:
         """Cancel all open orders via the broker adapter."""
