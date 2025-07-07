@@ -35,24 +35,23 @@ try:
     
     # Get the path to the quantstats folder
     current_dir = os.path.dirname(os.path.abspath(__file__))  # core directory
-    workspace_root = os.path.dirname(current_dir)  # FnO-Synapse directory
-    quantstats_path = os.path.join(workspace_root, 'quantstats')
+    quantstats_path = os.path.join(current_dir, 'quantstats')  # core/quantstats directory
     
-    # Add workspace root to sys.path for importing quantstats
-    if workspace_root not in sys.path:
-        sys.path.insert(0, workspace_root)
+    # Add core directory to sys.path for importing quantstats
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
     
     # Verify quantstats folder exists and import
     if os.path.exists(quantstats_path) and os.path.isdir(quantstats_path):
         import quantstats
-        print(f" Successfully imported local quantstats from: {quantstats_path}")
+        print(f"Successfully imported local quantstats from: {quantstats_path}")
     else:
         raise ImportError(f"Quantstats folder not found at: {quantstats_path}")
         
 except ImportError as e:
     quantstats = None
-    print(f" Failed to import local quantstats: {e}")
-    warnings.warn("Local quantstats folder not found. Please ensure you're running from the FnO-Synapse directory with the quantstats folder present.")
+    print(f"Failed to import local quantstats: {e}")
+    warnings.warn("Local quantstats folder not found. Please ensure the quantstats folder is in the core/ directory.")
 
 import numpy as np
 import pandas as pd
@@ -368,8 +367,7 @@ class Order:
         self.__position_id = position_id
         self.__leg_id = leg_id
         self.__ticker = ticker
-        assert size != 0
-        self.__size = size # Positive for buy, negative for sell
+        self.__size = size
         self.__stop_loss = stop_loss
         self.__take_profit = take_profit
         self.__tag = tag
@@ -465,7 +463,6 @@ class Trade:
         self.__take_profit = take_profit
         self.__entry_tag = entry_tag
 
-
         self.__exit_price: Optional[float] = None
         self.__exit_datetime: Optional[pd.Timestamp] = None
         self.__exit_spot: Optional[float] = None
@@ -497,6 +494,17 @@ class Trade:
             self.__broker.orders.insert(0, order) # Prioritize closing orders
             return order
 
+    @property
+    def strategy_id(self):
+        return self.__strategy_id
+
+    @property  
+    def position_id(self):
+        return self.__position_id
+
+    @property
+    def leg_id(self):
+        return self.__leg_id
 
     @property
     def ticker(self):
@@ -521,6 +529,24 @@ class Trade:
     @property
     def exit_datetime(self) -> Optional[int]: # Index in spot_data
         return self.__exit_datetime
+    
+    @property
+    def entry_tag(self) -> Optional[str]:
+        return self.__entry_tag
+    
+    @property
+    def exit_tag(self) -> Optional[str]:
+        return self.__exit_tag
+
+    @property
+    def sl(self) -> Optional[float]:
+        """Stop loss level for this trade (absolute price)."""
+        return self.__stop_loss
+    
+    @property
+    def tp(self) -> Optional[float]:
+        """Take profit level for this trade (absolute price)."""
+        return self.__take_profit
 
     @property
     def is_long(self):
@@ -561,7 +587,6 @@ class Trade:
         pnl_per_contract = price_diff * copysign(1, self.__size) # To align with P&L direction
         
         return pnl_per_contract / initial_value_per_contract if initial_value_per_contract else np.nan
-
 
     @property
     def value(self):
@@ -728,7 +753,9 @@ class _Broker:
                 for trade in list(trade_list): # Iterate copy of trade_list
                     
                     # Close the trade at this exit_price
-                    self._close_trade(trade, self.get_ticker_execution_price(trade.ticker), tag="Expired")
+                    # For long positions, we sell to close (is_buy_order=False)
+                    # For short positions, we buy to close (is_buy_order=True)
+                    self._close_trade(trade, self.get_ticker_execution_price(trade.ticker, not trade.is_long), tag="Expired")
 
                 if not self.trades.get(ticker): # If all trades for this symbol are closed
                     symbols_to_remove_from_trades.append(ticker)
@@ -753,6 +780,7 @@ class _Broker:
     # @profile
     def next(self): # Called for each spot bar
         self._process_orders()
+        self.stop_loss_take_profit()  # Check SL/TP triggers
 
         # Log equity
         self._equity[self.time] = self.equity()
@@ -887,6 +915,85 @@ class _Broker:
             self.positions[order.ticker] = Position(self, order.ticker)
         # Position object will query self.trades for its size/pl dynamically
         self.orders.remove(order) # Order processed
+
+    def stop_loss_take_profit(self):
+        """Check all active trades for SL/TP triggers and automatically close entire positions."""
+        
+        # Collect all trades safely to avoid modifying dict during iteration
+        all_trades = []
+        for ticker, trades_list in list(self.trades.items()):
+            for trade in list(trades_list):
+                all_trades.append((ticker, trade))
+        
+        # Track position_ids that have already been processed to avoid double-closing
+        processed_position_ids = set()
+        
+        # Now check each trade for SL/TP triggers
+        for ticker, trade in all_trades:
+            # Skip if trade was already closed by a previous SL/TP trigger
+            if ticker not in self.trades or trade not in self.trades[ticker]:
+                continue
+                
+            # Skip if this position_id was already processed
+            if trade.position_id in processed_position_ids:
+                continue
+            
+            # CRITICAL FIX: Skip SL/TP check on the same bar as entry
+            # This prevents immediate triggers due to bid-ask spread or timing issues
+            if trade.entry_datetime == self.time:
+                continue  # Skip SL/TP check on entry bar
+                
+            current_price = self.get_ticker_last_price(ticker)
+            if current_price is None:
+                continue
+            
+            sl_triggered = False
+            tp_triggered = False
+            
+            if trade.is_long:  # Long position
+                # Stop loss: price falls below SL level
+                if trade.sl is not None and current_price <= trade.sl:
+                    sl_triggered = True
+                # Take profit: price rises above TP level  
+                if trade.tp is not None and current_price >= trade.tp:
+                    tp_triggered = True
+                    
+            else:  # Short position
+                # Stop loss: price rises above SL level
+                if trade.sl is not None and current_price >= trade.sl:
+                    sl_triggered = True
+                # Take profit: price falls below TP level
+                if trade.tp is not None and current_price <= trade.tp:
+                    tp_triggered = True
+            
+            # If SL/TP triggered, close ALL trades with the same position_id
+            if sl_triggered or tp_triggered:
+                trigger_type = "Stop Loss Hit" if sl_triggered else "Take Profit Hit"
+                self._close_position_by_id(trade.position_id, trigger_type)
+                processed_position_ids.add(trade.position_id)
+    
+    def _close_position_by_id(self, position_id: str, reason: str):
+        """Close all trades with the given position_id."""
+        trades_to_close = []
+        
+        # Find all trades with the matching position_id
+        for ticker, trades_list in list(self.trades.items()):
+            for trade in list(trades_list):
+                if trade.position_id == position_id:
+                    trades_to_close.append((ticker, trade))
+        
+        # Close all trades in this position
+        for ticker, trade in trades_to_close:
+            current_price = self.get_ticker_last_price(ticker)
+            if current_price is not None:
+                self._close_trade(trade, current_price, reason)
+                print(f"Position {position_id}: Closed {ticker} due to {reason}")
+            else:
+                print(f"Position {position_id}: Could not close {ticker} - no price data")
+        
+        if trades_to_close:
+            print(f"Position {position_id}: All {len(trades_to_close)} trades closed due to {reason}")
+
 
 import time
 class Backtest:
@@ -1480,7 +1587,7 @@ class Backtest:
                 equity_df = results.get('_equity_curve')
                 if equity_df is not None:
                     equity_series = equity_df['Equity']
-                    returns_series = equity_series.pct_change().dropna()
+                    returns_series = equity_series.pct_change(fill_method=None).dropna()
                     
                     # Set filename
                     if filename is None:
@@ -1553,7 +1660,7 @@ class Backtest:
             raise ValueError("No equity curve data found in results. Cannot generate tear sheet.")
         
         # Convert equity to returns
-        equity_series = equity_df['Equity'].pct_change().dropna()
+        equity_series = equity_df['Equity'].pct_change(fill_method=None).dropna()
         
         # Set up file path
         current_dir = os.getcwd()
@@ -1563,8 +1670,75 @@ class Backtest:
             tear_sheet_path = output_path
 
         # Extract trade statistics and trade table from results
-        trade_stats = results
+        trade_stats = results.copy()  # Make a copy to avoid modifying original
         trade_table = results.get('_trades', pd.DataFrame())
+        
+        # Calculate position-wise profit/loss statistics
+        if not trade_table.empty and 'PnL' in trade_table.columns:
+            # Group trades by position_id to get position-level P&L
+            if 'position_id' in trade_table.columns:
+                # Group by position_id and sum P&L for each position
+                position_pnl = trade_table.groupby('position_id')['PnL'].sum()
+                
+                # Classify positions
+                profit_positions = position_pnl[position_pnl > 0]
+                loss_positions = position_pnl[position_pnl < 0]
+                breakeven_positions = position_pnl[position_pnl == 0]
+                
+                # Add position-wise metrics to trade_stats
+                trade_stats['Profit Making Positions'] = len(profit_positions)
+                trade_stats['Loss Making Positions'] = len(loss_positions)
+                trade_stats['Breakeven Positions'] = len(breakeven_positions)
+                trade_stats['Total Positions'] = len(position_pnl)
+                
+                # Calculate additional position-wise metrics
+                if len(position_pnl) > 0:
+                    trade_stats['Profit Making Positions [%]'] = (len(profit_positions) / len(position_pnl)) * 100
+                    trade_stats['Loss Making Positions [%]'] = (len(loss_positions) / len(position_pnl)) * 100
+                    trade_stats['Breakeven Positions [%]'] = (len(breakeven_positions) / len(position_pnl)) * 100
+                    
+                    # Average P&L for winning and losing positions
+                    trade_stats['Avg Profit Per Winning Position [$]'] = profit_positions.mean() if not profit_positions.empty else 0
+                    trade_stats['Avg Loss Per Losing Position [$]'] = loss_positions.mean() if not loss_positions.empty else 0
+                    
+                    # Total P&L breakdown
+                    trade_stats['Total Profit from Winners [$]'] = profit_positions.sum() if not profit_positions.empty else 0
+                    trade_stats['Total Loss from Losers [$]'] = loss_positions.sum() if not loss_positions.empty else 0
+                    
+                    # Position size statistics
+                    trades_per_position = trade_table.groupby('position_id').size()
+                    trade_stats['Avg Trades Per Position'] = trades_per_position.mean()
+                    trade_stats['Max Trades Per Position'] = trades_per_position.max()
+                    trade_stats['Min Trades Per Position'] = trades_per_position.min()
+                
+                print(f"Position-wise Analysis:")
+                print(f"  Total Positions: {len(position_pnl)}")
+                print(f"  Profit Making Positions: {len(profit_positions)} ({len(profit_positions)/len(position_pnl)*100:.1f}%)")
+                print(f"  Loss Making Positions: {len(loss_positions)} ({len(loss_positions)/len(position_pnl)*100:.1f}%)")
+                print(f"  Breakeven Positions: {len(breakeven_positions)} ({len(breakeven_positions)/len(position_pnl)*100:.1f}%)")
+                print(f"  Average Trades per Position: {trades_per_position.mean():.1f}")
+            else:
+                print("Warning: 'position_id' column not found in trade data. Using individual trade statistics.")
+                # Fallback to individual trade analysis
+                profit_trades = trade_table[trade_table['PnL'] > 0]
+                loss_trades = trade_table[trade_table['PnL'] < 0]
+                breakeven_trades = trade_table[trade_table['PnL'] == 0]
+                
+                trade_stats['Profit Making Positions'] = len(profit_trades)
+                trade_stats['Loss Making Positions'] = len(loss_trades)
+                trade_stats['Breakeven Positions'] = len(breakeven_trades)
+                trade_stats['Total Positions'] = len(trade_table)
+                
+                if len(trade_table) > 0:
+                    trade_stats['Profit Making Positions [%]'] = (len(profit_trades) / len(trade_table)) * 100
+                    trade_stats['Loss Making Positions [%]'] = (len(loss_trades) / len(trade_table)) * 100
+                    trade_stats['Breakeven Positions [%]'] = (len(breakeven_trades) / len(trade_table)) * 100
+        else:
+            print("No trade data available for position analysis")
+            trade_stats['Profit Making Positions'] = 0
+            trade_stats['Loss Making Positions'] = 0
+            trade_stats['Breakeven Positions'] = 0
+            trade_stats['Total Positions'] = 0
         
         # Filter by plotting date if provided
         if plotting_date is not None:
@@ -1577,7 +1751,7 @@ class Backtest:
             
             # Extract equity curve and prepare series for quantstats
             equity_df = results['_equity_curve']
-            equity_series = equity_df['Equity'].resample('1D').last().pct_change().dropna()
+            equity_series = equity_df['Equity'].resample('1D').last().pct_change(fill_method=None).dropna()
             
             # Check if benchmark is already provided in results, otherwise create one
             benchmark_series = None
@@ -1605,7 +1779,7 @@ class Backtest:
                     if daily_benchmark_data:
                         benchmark_series = pd.concat(daily_benchmark_data).sort_index()
                         benchmark_series = benchmark_series[~benchmark_series.index.duplicated(keep='first')]
-                        benchmark_series = benchmark_series.pct_change().dropna()
+                        benchmark_series = benchmark_series.pct_change(fill_method=None).dropna()
                         benchmark_series = benchmark_series.rename("Benchmark")
                         print(f"Created default benchmark with {len(benchmark_series)} data points")
                     else:
@@ -1615,8 +1789,8 @@ class Backtest:
                     print(f"Warning: Could not create benchmark data: {e}")
                     benchmark_series = None
             
-            # Get trade statistics from results
-            trade_stats = results
+            # trade_stats already contains the position-wise metrics we calculated earlier
+            # Don't overwrite it with original results
             trade_table = results.get('_trades', pd.DataFrame())
             
             # Use quantstats reports.html function

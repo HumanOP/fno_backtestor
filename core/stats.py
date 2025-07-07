@@ -122,6 +122,15 @@ def compute_stats(
             'ReturnPct': [getattr(t, 'pl_pct', t.pl / t.entry_price if t.entry_price else 0) for t in trades],
             'EntryTag': [getattr(t, 'entry_tag', None) for t in trades],
             'ExitTag': [getattr(t, 'exit_tag', None) for t in trades],
+            'position_id': [t.position_id for t in trades],
+            'strategy_id': [t.strategy_id for t in trades],
+            'leg_id': [t.leg_id for t in trades],
+            'ticker': [t.ticker for t in trades],
+            'size': [t.size for t in trades],
+            'entry_price': [t.entry_price for t in trades],
+            'exit_price': [t.exit_price for t in trades],
+            'SL': [t.sl if t.sl is not None else np.nan for t in trades],
+            'TP': [t.tp if t.tp is not None else np.nan for t in trades],
         })
 
     trades_df = trades_df[trades_df['ExitTime'].notna()]
