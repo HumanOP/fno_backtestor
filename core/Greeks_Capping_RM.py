@@ -4,7 +4,7 @@ class RiskManagement:
     def __init__(self):
         self.initial_greeks = {}  # Store initial Greeks and IV for each leg
         self.default_thresholds = {
-            'delta': 0.7,    # Absolute delta threshold
+            'delta': 0.5,  # Absolute delta threshold
             'gamma': 0.1,    # Gamma threshold
             'theta': -0.05,  # Theta threshold (negative for decay)
             'vega': 0.2,     # Vega threshold

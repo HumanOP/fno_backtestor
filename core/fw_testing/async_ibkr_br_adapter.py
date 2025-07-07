@@ -1,4 +1,9 @@
 # ibkr_broker_adapter.py
+import sys
+import os
+# Add the parent directory to the Python path to allow imports from core
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+print(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import traceback
 import warnings
 from datetime import datetime, date as DateObject
@@ -11,11 +16,13 @@ import re
 import atexit
 import threading
 import logging
-from backtesting_opt import Trade, Order, Position
+
+from core.backtesting_opt import Trade, Order, Position
 from live_data_fetcher import _Data, Endpoint
 from ib_async import Contract, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, Order, Fill
-from ib_insync import IB
+from ib_async import IB
 import pytz
+
 
 class IBKRBrokerAdapter:
     """Interactive Brokers-specific broker adapter implementation."""

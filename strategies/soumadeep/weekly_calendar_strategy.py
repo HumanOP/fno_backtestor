@@ -25,10 +25,10 @@ class DoubleCalendarStrategy(Strategy):
     def init(self):
         super().init()
         self.legs = {
-            'leg1': {'type': 'CE', 'expiry_type': 'weekly', 'expiry_range': [14, 16], 'target_strike': 'ATM', 'action': 'SELL', 'stop_loss': None, 'take_profit': None},
-            'leg2': {'type': 'PE', 'expiry_type': 'weekly', 'expiry_range': [14, 16], 'target_strike': 'ATM', 'action': 'SELL', 'stop_loss': None, 'take_profit': None},
-            'leg3': {'type': 'CE', 'expiry_type': 'weekly', 'expiry_range': [20, 23], 'target_strike': 'ATM', 'action': 'BUY', 'stop_loss': None, 'take_profit': None},
-            'leg4': {'type': 'PE', 'expiry_type': 'weekly', 'expiry_range': [20, 23], 'target_strike': 'ATM', 'action': 'BUY', 'stop_loss': None, 'take_profit': None}
+            'leg1': {'type': 'CE', 'expiry_type': 'weekly', 'expiry_range': [7, 8], 'target_strike': 'ATM', 'action': 'SELL', 'stop_loss': None, 'take_profit': None},
+            'leg2': {'type': 'PE', 'expiry_type': 'weekly', 'expiry_range': [7, 8], 'target_strike': 'ATM', 'action': 'SELL', 'stop_loss': None, 'take_profit': None},
+            'leg3': {'type': 'CE', 'expiry_type': 'weekly', 'expiry_range': [14, 16], 'target_strike': 'ATM', 'action': 'BUY', 'stop_loss': None, 'take_profit': None},
+            'leg4': {'type': 'PE', 'expiry_type': 'weekly', 'expiry_range': [14, 16], 'target_strike': 'ATM', 'action': 'BUY', 'stop_loss': None, 'take_profit': None}
         }
         self.entry_premium = None
         self.entry_spot = None
@@ -216,7 +216,7 @@ class DoubleCalendarStrategy(Strategy):
                 spot_move = abs(self.spot - self.entry_spot)
                 premium_move = 0.3 * self.entry_premium  # 30% of entry premium
                 strike_step = 50  # TODO: Derive from database
-                adjustment_triggered = spot_move >= 150
+                adjustment_triggered = spot_move >= 100
 
                 # Check premium ratios
                 call_sell_premium = self.legs['leg1']["data"]["close"]
@@ -379,9 +379,10 @@ if __name__ == "__main__":
         cash=10000000,
         commission_per_contract=0.02,
         option_multiplier=75,
-        
+        #start_date="2025-06-01",  # Set to ensure data availability
+        #end_date="2025-06-20"
     )
 
-    stats = bt.run(start_date="2022-06-01", end_date="2022-06-20")
+    stats = bt.run()
     print(stats)
     bt.tear_sheet()
