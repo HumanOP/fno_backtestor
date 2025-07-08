@@ -537,17 +537,17 @@ class Trade:
     def pl(self):
         return self.__pl 
 
-    @setattr
-    def set_pl(self,pl):
-        self.__pl=pl
+    @pl.setter
+    def pl(self, pl):
+        self.__pl = pl
 
     @property
     def pl_pct(self):
         return self.__pl_pct 
 
-    @setattr
-    def set_pl_pct(self,pl):
-        self.__pl_pct=pl
+    @pl_pct.setter
+    def pl_pct(self, pl_pct):
+        self.__pl_pct = pl_pct
         
 
     
@@ -578,9 +578,9 @@ class Trade:
         return self.__value
        
 
-    @setattr
-    def setvalue(self,val):
-        self.__value=val
+    @value.setter
+    def value(self, val):
+        self.__value = val
 
 
 class _Broker:
