@@ -423,8 +423,9 @@ class WalkForwardOptimizer:
             data_obj = _Data(db_path, start_date, end_date)
             
             tables = data_obj.get_tables_in_date_range()
-            
+
             if not tables:
+                data_obj.close()
                 return None, None, None, None, None, None
             
             # Get start and end dates by loading only first and last tables
