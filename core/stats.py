@@ -54,7 +54,7 @@ def geometric_mean(returns: pd.Series) -> float:
 def compute_stats(
     orders,
     trades,
-    equity_curve,
+    equity,
     strategy_instance=None,
     risk_free_rate: float = 0.0,
     positions: dict = None
@@ -62,11 +62,11 @@ def compute_stats(
     assert -1 < risk_free_rate < 1
 
     # Ensure index is datetime
-    if not isinstance(equity_curve.index, pd.DatetimeIndex):
-        equity_curve.index = pd.to_datetime(equity_curve.index)
+    if not isinstance(equity.index, pd.DatetimeIndex):
+        equity.index = pd.to_datetime(equity.index)
 
-    index = equity_curve.index
-    equity = equity_curve.rename("Equity").to_frame()
+    index = equity.index
+    equity = equity.rename("Equity").to_frame()
 
     # Handle empty equity curve
     if len(index) == 0:
