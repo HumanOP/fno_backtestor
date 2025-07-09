@@ -127,6 +127,24 @@ def compute_stats(
             except (KeyError, TypeError, ValueError, AttributeError):
                 return np.nan
         
+        # Try to get option multiplier from strategy instance's broker, fallback to 75
+        option_multiplier = 75  # Default value
+        if strategy_instance and hasattr(strategy_instance, '_broker'):
+            option_multiplier = getattr(strategy_instance._broker, '_option_multiplier', 75)
+        
+        # Helper function to calculate correct PnL for tearsheet display
+        def calculate_pnl(trade):
+            entry_price = getattr(trade, 'entry_price', 0)
+            exit_price = getattr(trade, 'exit_price', 0)
+            size = getattr(trade, 'size', 0)
+            
+            if entry_price and exit_price and size:
+                # Correct PnL calculation: size × (exit_price - entry_price) × option_multiplier
+                return size * (exit_price - entry_price) * option_multiplier
+            else:
+                # Fallback to trade.pl if any component is missing
+                return getattr(trade, 'pl', 0)
+        
         trades_df = pd.DataFrame({
             'EntryBar': [get_exact_bar(getattr(t, 'entry_datetime', None), index) for t in trades],
             'ExitBar': [get_exact_bar(getattr(t, 'exit_datetime', None), index) for t in trades],
@@ -134,12 +152,15 @@ def compute_stats(
             'Size': [getattr(t, 'size', 0) for t in trades],
             'EntryPrice': [getattr(t, 'entry_price', 0) for t in trades],
             'ExitPrice': [getattr(t, 'exit_price', 0) for t in trades],
-            'PnL': [getattr(t, 'pl', 0) for t in trades],
+            'PnL': [calculate_pnl(t) for t in trades],  # Use recalculated PnL
             'ReturnPct': [getattr(t, 'pl_pct', 0) for t in trades],
             'EntryTime': [getattr(t, 'entry_datetime', None) for t in trades],
             'ExitTime': [getattr(t, 'exit_datetime', None) for t in trades],
             'Tag': [getattr(t, 'entry_tag', None) for t in trades],  # Use entry_tag
-            'Reason': [getattr(t, 'exit_tag', None) for t in trades]  # Use exit_tag
+            'Reason': [getattr(t, 'exit_tag', None) for t in trades],  # Use exit_tag
+            'position_id': [getattr(t, 'position_id', 'UNKNOWN') for t in trades],  # Add position_id
+            'strategy_id': [getattr(t, 'strategy_id', 'UNKNOWN') for t in trades],  # Add strategy_id
+            'leg_id': [getattr(t, 'leg_id', 'UNKNOWN') for t in trades]  # Add leg_id
         })
         trades_df['Duration'] = trades_df['ExitTime'] - trades_df['EntryTime']
         # Filter out trades without exit times (open trades)

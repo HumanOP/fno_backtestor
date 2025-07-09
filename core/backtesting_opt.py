@@ -839,29 +839,32 @@ class _Broker:
                     self._reduce_trade(order, exec_price)
 
     def _process_trades(self):
-        for trade in self.trades:
+        for trade in self.active_trades:
             current_ticker_price=None
             ''' for pnl '''
             if trade.exit_price is None: # Mark-to-market P&L for open trade
                 current_ticker_price = self.get_ticker_last_price(trade.ticker)
                 if current_ticker_price is None: # Not in current chain / no price
-                    trade.set_pl(0)
-                    trade.set_pl_pct(0)
-                    trade.set_value(0)
+                    trade.pl = 0
+                    trade.pl_pct = 0
+                    trade.value = 0
                     continue
                 price_diff = current_ticker_price - trade.entry_price
             else: # Realized P&L for closed trade
                 price_diff = trade.exit_price - trade.entry_price
 
-            trade.set_pl(trade.size * price_diff * self._option_multiplier)
+            trade.pl = trade.size * price_diff * self._option_multiplier
 
             # this is for pnl percentage
             initial_value_per_contract = trade.entry_price
             pnl_per_contract = price_diff * copysign(1, trade.size) # To align with P&L direction
-            trade.set_pl_pct(pnl_per_contract / initial_value_per_contract if initial_value_per_contract else np.nan)
+            trade.pl_pct = pnl_per_contract / initial_value_per_contract if initial_value_per_contract else np.nan
 
             #this for trade value
-            trade.set_value(trade.size * current_ticker_price * self._option_multiplier)
+            if current_ticker_price is not None:
+                trade.value = trade.size * current_ticker_price * self._option_multiplier
+            else:
+                trade.value = 0
            
 
 
@@ -1695,3 +1698,204 @@ class Backtest:
             print("Available results keys:", list(results.keys()) if hasattr(results, 'keys') else "N/A")
             import traceback
             traceback.print_exc()
+            
+    def position_tearsheet(self, *, results: pd.Series = None, filename=None, open_browser=True, output_path=None):
+        """
+        Generate a position-level tear sheet report by clubbing trades with the same position_id.
+        Uses the original equity curve and metrics from results, but displays position-level trade logs.
+        
+        Parameters:
+        - results: pd.Series, the backtest results. If None, uses the last run results.
+        - filename: str, the file path to save the HTML report. Default is 'position_tearsheet.html'.
+        - open_browser: bool, whether to open the report in a browser. Default is True.
+        - output_path: str, the directory path to save the HTML report. Default is current directory.
+        """
+        if results is None:
+            if self._results is None:
+                raise RuntimeError('First issue `backtest.run()` to obtain results.')
+            results = self._results
+
+        if quantstats is None:
+            raise ImportError("quantstats is required for position_tearsheet functionality. Please install quantstats.")
+
+        # Get equity curve from results
+        equity_df = results.get('_equity_curve')
+        if equity_df is None:
+            raise ValueError("No equity curve data found in results. Cannot generate position tearsheet.")
+
+        # Get trade data from results for position aggregation
+        trade_table = results.get('_trades', pd.DataFrame())
+        if trade_table.empty:
+            raise ValueError("No trade data found in results. Cannot generate position tearsheet.")
+        
+        # Convert trade data to DataFrame if it's not already
+        if not isinstance(trade_table, pd.DataFrame):
+            # Convert list of Trade objects to DataFrame
+            trade_data = []
+            for trade in trade_table:
+                trade_data.append({
+                    'strategy_id': trade.strategy_id,
+                    'position_id': trade.position_id,
+                    'leg_id': trade.leg_id,
+                    'Ticker': trade.ticker,
+                    'Size': trade.size,
+                    'EntryPrice': trade.entry_price,
+                    'ExitPrice': trade.exit_price,
+                    'EntryTime': trade.entry_datetime,
+                    'ExitTime': trade.exit_datetime,
+                    'Tag': trade.entry_tag,
+                    'Reason': trade.exit_tag,
+                    'PnL': trade.pl
+                })
+            trade_table = pd.DataFrame(trade_data)
+        
+        # Group trades by position_id to create position-level trade logs
+        position_data = []
+        
+        for position_id, position_trades in trade_table.groupby('position_id'):
+            # Calculate position-level metrics
+            total_pl = 0
+            entry_times = []
+            exit_times = []
+            entry_values = []
+            exit_values = []
+            
+            # Calculate combined P&L for the position
+            for _, trade in position_trades.iterrows():
+                if trade['ExitPrice'] is not None and trade['EntryPrice'] is not None:
+                    trade_pl = trade['Size'] * (trade['ExitPrice'] - trade['EntryPrice'])
+                    total_pl += trade_pl
+                    
+                    entry_times.append(trade['EntryTime'])
+                    exit_times.append(trade['ExitTime'])
+                    entry_values.append(abs(trade['Size']) * trade['EntryPrice'])
+                    exit_values.append(abs(trade['Size']) * trade['ExitPrice'])
+            
+            if not entry_times:
+                continue
+                
+            # Calculate position-level statistics
+            position_entry_time = min(entry_times)
+            position_exit_time = max([t for t in exit_times if t is not None]) if any(t is not None for t in exit_times) else None
+            
+            # Calculate entry and exit values
+            total_entry_value = sum(entry_values)
+            total_exit_value = sum(exit_values)
+            total_size = sum(abs(trade['Size']) for _, trade in position_trades.iterrows())
+            
+            # Position return percentage
+            position_return_pct = (total_pl / total_entry_value * 100) if total_entry_value > 0 else 0
+            
+            # Get strategy and leg info from first trade
+            first_trade = position_trades.iloc[0]
+            
+            # Calculate position duration
+            duration = None
+            if position_exit_time is not None and position_entry_time is not None:
+                duration = position_exit_time - position_entry_time  # Duration as timedelta
+            
+            position_data.append({
+                'Position ID': position_id,
+                'Strategy ID': first_trade['strategy_id'],
+                'Legs': len(position_trades),
+                'Tickers': ', '.join(position_trades['Ticker'].unique()),
+                'Entry Time': position_entry_time,
+                'Exit Time': position_exit_time,
+                'Entry Value': total_entry_value,
+                'Exit Value': total_exit_value,
+                'PnL': total_pl,
+                'Return %': position_return_pct,
+                'Duration': duration,
+                'Entry Tag': first_trade['Tag'],
+                'Exit Reason': position_trades['Reason'].iloc[-1] if 'Reason' in position_trades.columns else None,
+                'Total Size': total_size
+            })
+        
+        # Create position-level DataFrame for display
+        position_df = pd.DataFrame(position_data)
+        
+        if position_df.empty:
+            raise ValueError("No completed positions found for tearsheet generation.")
+
+        # Set up file path
+        current_dir = os.getcwd()
+        if output_path is None:
+            tear_sheet_path = os.path.join(current_dir, filename if filename else "position_tearsheet.html")
+        else:
+            tear_sheet_path = output_path
+
+        # Generate the tear sheet using quantstats (same logic as tear_sheet function)
+        try:
+            # Prepare parameters for the tear sheet
+            strategy_title = f"{results.get('_strategy', 'Options Strategy')} - Position Level Analysis"
+            
+            # Extract equity curve and prepare series for quantstats (same as tear_sheet)
+            equity_df = results['_equity_curve']
+            equity_series = equity_df['Equity'].resample('1D').last().pct_change().dropna()
+            
+            # Check if benchmark is already provided in results, otherwise create one (same as tear_sheet)
+            benchmark_series = None
+            if '_benchmark' in results and results['_benchmark'] is not None:
+                benchmark_series = results['_benchmark']
+                print(f"Using provided benchmark with {len(benchmark_series)} data points")
+            else:
+                # Create a simple benchmark (buy and hold) or use None
+                try:
+                    data = _Data(self.db_path, start_date=self._start_date, end_date=self._end_date)
+                    daily_benchmark_data = []
+                    
+                    for table in data._table_names:
+                        try:
+                            data.load_table(table)
+                            if data._spot_table is not None and not data._spot_table.empty:
+                                daily_spot = data._spot_table['spot_price'].resample('1D').last()
+                                daily_benchmark_data.append(daily_spot)
+                        except Exception as table_error:
+                            print(f"Warning: Could not load table {table}: {table_error}")
+                            continue
+                    
+                    data.close()
+                    
+                    if daily_benchmark_data:
+                        benchmark_series = pd.concat(daily_benchmark_data).sort_index()
+                        benchmark_series = benchmark_series[~benchmark_series.index.duplicated(keep='first')]
+                        benchmark_series = benchmark_series.pct_change().dropna()
+                        benchmark_series = benchmark_series.rename("Benchmark")
+                        print(f"Created default benchmark with {len(benchmark_series)} data points")
+                    else:
+                        benchmark_series = None
+                        print("No benchmark data available")
+                except Exception as e:
+                    print(f"Warning: Could not create benchmark data: {e}")
+                    benchmark_series = None
+            
+            # Get trade statistics from results (keep original, only modify trade_table to position-based)
+            trade_stats = results
+            
+            # Use quantstats reports.html function
+            quantstats.reports.html(
+                returns=equity_series,
+                title=f"{strategy_title} - Performance Report",
+                equity_df=equity_df,
+                benchmark=benchmark_series,
+                output=tear_sheet_path,
+                trade_stats=trade_stats,  # Use original trade stats
+                trade_table=position_df,  # Use position-level trade table for display
+                _trade_start_bar=0,  # Use 0 instead of date to avoid iloc indexing error
+            )
+            
+            print("Position tearsheet generation completed.")
+            print(f"Position tearsheet generated and saved to: {tear_sheet_path}")
+            print(f"Trade logs grouped by position_id for analysis:")
+            print(f"  - Total positions analyzed: {len(position_df)}")
+            
+            if open_browser:
+                webbrowser.open(f'file://{tear_sheet_path}')
+                
+        except Exception as e:
+            print(f"Error generating position tearsheet: {e}")
+            print("Available results keys:", list(results.keys()) if hasattr(results, 'keys') else "N/A")
+            import traceback
+            traceback.print_exc()
+        
+        return position_df
