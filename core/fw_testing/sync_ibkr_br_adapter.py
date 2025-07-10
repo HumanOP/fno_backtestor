@@ -9,6 +9,7 @@ from typing import Dict, Optional, List, Any
 import time
 import logging
 from ib_async import IB, Contract, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, Order, Trade, Fill
+import re
 
 class IBKRBrokerAdapter:
     """Interactive Brokers-specific broker adapter implementation - Synchronous version."""
@@ -150,13 +151,74 @@ class IBKRBrokerAdapter:
             logging.error(f"Error fetching trades from IBKR: {str(e)}")
             return []
 
+    def ticker_mapper(self, ticker: str):
+        """Parse option ticker string into components."""
+        # Will need a cache for this function to avoid repeated parsing
+        try:
+            # Pattern: underlying + expiry (2digit+3letter+2digit) + strike + CE/PE
+            # Example: NIFTY25JUL2525400CE -> NIFTY, 25JUL25, 25400, CE
+            pattern = r'^(.+?)(\d{2}[A-Z]{3}\d{2})(\d+)(CE|PE)$'
+            match = re.match(pattern, ticker)
+            
+            if not match:
+                logging.error(f"Failed to parse ticker: {ticker}")
+                return None
+                
+            underlying = match.group(1)
+            expiry_str = match.group(2)
+            strike_str = match.group(3)
+            option_type = match.group(4)
+            
+            # Map NIFTY to NIFTY50 for IBKR compatibility
+            if underlying == 'NIFTY':
+                underlying = 'NIFTY50'
+
+            # Convert strike to float
+            strike_price = float(strike_str)
+            
+            # Convert option type
+            right = 'C' if option_type == 'CE' else 'P'
+            
+            # Parse expiry date (format: DDMMMYY)
+            day = expiry_str[:2]
+            month_abbr = expiry_str[2:5]
+            year = f"20{expiry_str[5:7]}"
+            
+            # Month mapping
+            month_map = {
+                'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04',
+                'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08',
+                'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
+            }
+            
+            month = month_map.get(month_abbr)
+            if not month:
+                logging.error(f"Invalid month abbreviation: {month_abbr}")
+                return None
+                
+            expiry_date = f"{year}{month}{day}"
+
+            return (underlying, expiry_date, strike_price, right)
+
+        except Exception as e:
+            logging.error(f"Error parsing ticker {ticker}: {str(e)}")
+            return None
+
     def qualify_contract(self, ticker: str) -> Optional[Dict[str, Any]]:
         """Qualify a ticker into an IBKR contract."""
         try:
-            contract = Contract()
-            contract.localSymbol = ticker
-            contract.secType = 'OPT'  # Assuming options trading
-            contract.exchange = 'NSE'
+            ticker_parts = self.ticker_mapper(ticker)
+            if not ticker_parts:
+                logging.error(f"Failed to parse ticker: {ticker}")
+                return None
+            underlying, expiry_date, strike_price, right = ticker_parts
+            contract = Contract(symbol=underlying,
+                                lastTradeDateOrContractMonth=expiry_date,
+                                strike=strike_price,
+                                right=right,
+                                secType='OPT',      # Assuming options trading
+                                exchange='NSE',
+                                currency='INR')
             qualified = self.ib.qualifyContracts(contract)
             if not qualified:
                 logging.error(f"Failed to qualify contract for ticker {ticker}")
@@ -170,7 +232,7 @@ class IBKRBrokerAdapter:
             logging.error(f"Error qualifying contract {ticker}: {str(e)}")
             return None
 
-    def place_order(self, ticker: str, action: str, quantity: float, order_type: str, order_params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    def place_order(self, ticker: str, action: str, quantity: float, order_type: str = 'MARKET', order_params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
         """Place an order with IBKR."""
         contract = self.qualify_contract(ticker)
         if contract is None:
@@ -230,15 +292,19 @@ class IBKRBrokerAdapter:
         self._order_fill_callback = callback
         self.ib.execDetailsEvent += self._on_exec_details
 
-    def _on_exec_details(self, trade: 'Trade', fill: 'Fill'):
+    # def _on_exec_details(self, trade: 'Trade', fill: 'Fill'):
+    #     """Handle IBKR execution details and invoke callback."""
+    #     if self._order_fill_callback and trade.orderStatus.status == 'Filled':
+    #         self._order_fill_callback(
+    #             order_id=trade.order.orderId,
+    #             quantity=fill.execution.cumQty,
+    #             price=fill.execution.price,
+    #             ticker=trade.contract.localSymbol
+    #         )
+
+    def _on_exec_details(self, **kwargs):
         """Handle IBKR execution details and invoke callback."""
-        if self._order_fill_callback and trade.orderStatus.status == 'Filled':
-            self._order_fill_callback(
-                order_id=trade.order.orderId,
-                quantity=fill.execution.cumQty,
-                price=fill.execution.price,
-                ticker=trade.contract.localSymbol
-            )
+        print(f"Execution outcome: {kwargs}")
 
     def disconnect(self) -> None:
         """Disconnect from IBKR."""
