@@ -79,7 +79,7 @@ class _Broker:
     def update_positions(self):
         """Update positions from broker adapter."""
         try:
-            self.positions = self._adapter.get_positions()
+            self.positionbook = self._adapter.get_positions()
             logging.info("Positions updated")
         except Exception as e:
             logging.error(f"Error updating positions: {str(e)}")
@@ -87,7 +87,7 @@ class _Broker:
     def update_orders(self):
         """Update orders from broker adapter."""
         try:
-            self.orders = self._adapter.get_orders()
+            self.orderbook = self._adapter.get_orders()
             logging.info("Orders updated")
         except Exception as e:
             logging.error(f"Error updating orders: {str(e)}")
@@ -95,7 +95,7 @@ class _Broker:
     def update_trades(self):
         """Update trades from broker adapter."""
         try:
-            self.trades = self._adapter.get_trades()
+            self.tradebook = self._adapter.get_trades()
             logging.info("Trades updated")
         except Exception as e:
             logging.error(f"Error updating trades: {str(e)}")
@@ -113,6 +113,7 @@ class _Broker:
 
     def _process_orders(self):
         for order in list(self.orders): # Iterate a copy
+            print(f"Processing order: {order}")
             action = "BUY" if order.size > 0 else "SELL"
             required_margin = self.margin_impact(order.ticker, action, order.size)
             if self.cash < required_margin:
@@ -121,11 +122,12 @@ class _Broker:
                 continue
             
             if order.size != 0: # If any part of the order remains to be opened
-                action = "BUY" if order.size > 0 else "SELL"
-                order_id = self._adapter.place_order(order.ticker, action, order.size, order.tag)
+                order_id = self._adapter.place_order(order.ticker, action, order.size, "MARKET", order.tag)
                 self.active_order_ids[order_id] = order
 
                 self.orders.remove(order) # Order sent to broker, remove from internal list
+
+        return self.active_order_ids
         
     def _open_trade(self, order: Order, entry_price: Optional[float], entry_datetime: Optional[pd.Timestamp]):
         trade = Trade(
@@ -247,24 +249,24 @@ class _Broker:
         return margin_impact
 
     def on_order_fill(self) -> None:
-        for order_id, order in self.active_order_ids:
-            price = self.get_ticker_last_price(ticker=order.ticker)  # NOT CORRECT ----- ( this price we will get from ibkr's some function)
-
+        for order_id, order in self.active_order_ids.items():
+            # price = self.get_ticker_last_price(ticker=order.ticker)  # NOT CORRECT ----- ( this price we will get from ibkr's some function)
+            print(f"Checking trades: {self._adapter.get_trades()}")
             for trade in self._adapter.get_trades():
-                if trade['order'] == order_id and trade['orderStatus'] == 'Filled':  # NOT CORRECT ------- ( need to implement the order id)
+                if trade["orderStatus"].orderId == order_id and trade["orderStatus"].status == 'Filled': 
                     if order.trade is None:
                         self._open_trade(       # set new internal trade object
                             order,
-                            entry_price=price,
-                            entry_datetime=pd.Timestamp.now()
+                            entry_price=trade['fills'][0].execution.price,
+                            entry_datetime=trade['fills'][0].execution.time
                         )
                         self.active_order_ids.pop(order_id)
 
                     else: 
                         self._reduce_trade(     # reduce and set new internal trade object
                             order,
-                            exit_price=price,
-                            exit_datetime=pd.Timestamp.now()
+                            exit_price=trade['fills'][0].execution.price,
+                            exit_datetime=trade['fills'][0].execution.time
                         )
                         self.active_order_ids.pop(order_id)
 
@@ -305,38 +307,23 @@ if __name__ == "__main__":
     # Initialize the IBKR adapter
     ibkr_adapter = IBKRBrokerAdapter(host='localhost', port=7497, client_id=1)
     try:
+        t = 10
+        import time
         broker = _Broker(option_multiplier=1, broker_adapter=ibkr_adapter,data=fetcher)
-        from ib_async import MarketOrder, Contract
-
-        # print(f"pos: {broker.positions}\n\norders: {broker.orders}\n\ntrades: {broker.trades}")
-        print(f"Current Equity: {broker.equity}, Cash: {broker.cash}")
-        
-        # Get latest price for a ticker
-        ticker="NIFTY10JUL25400CE"
+        ticker = "NIFTY10JUL2525400CE"
         order = broker.new_order("1","1","1", ticker, 75)
-        margin_impact = broker.margin_impact(ticker, "BUY", 75)
-        contract = Contract()
-        contract.localSymbol = ticker
-        contract.secType = 'OPT'  # Assuming options trading
-        contract.exchange = 'NSE'
-        qualified = ibkr_adapter.ib.qualifyContracts(contract)
-        print(f"Latest order: {order}")
-        print(f"Margin Impact: {margin_impact}")
-        print(f"Contract: {qualified}")
-        # ib_contract = qualified.get('contract')
-        # if not ib_contract:
-        #     print("No valid IBKR contract provided")
+        margin_impact = broker.margin_impact(ticker, action="BUY", quantity=75)
+        print(f"Margin Impact for {ticker}: {margin_impact}")
+        while t>0:
+            t = t -1
+            broker.next()  # Process the order
+            
+            time.sleep(1)
 
-        # order = MarketOrder("BUY", 75)
         # whatif = ibkr_adapter.ib.whatIfOrder(ib_contract, order)
         # print(whatif)
         # return float(whatif.initMarginChange) if whatif and whatif.initMarginChange else None
         
-        # broker.next()
-        # ticker_data = fetcher.get_ticker_data(ticker=ticker)
-        # data = pd.read_csv(BytesIO(ticker_data))
-        # print(ticker, data['ts'].values[0],data['systemTime'].values[0],datetime.now(pytz.timezone('UTC')))
-
     except Exception as e:
         print(f"Error: {e}")
         traceback.print_exc()
