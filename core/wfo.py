@@ -467,10 +467,14 @@ class WalkForwardOptimizer:
 
             results_list = []
             trades_list = []
-            equity_curves = []
+            equity_curves = []  # Store actual equity values, not percentage changes
             orders_list = []
             last_strategy = None
             iteration_count = 0
+            
+            # Track cumulative equity across all periods
+            cumulative_equity = self.cash
+            overall_equity_curve = pd.Series(dtype=float)
             
             while test_end_date <= data_end_date:
                 iteration_count += 1
@@ -523,16 +527,7 @@ class WalkForwardOptimizer:
                     break
 
                 try:
-                    # Create optimized strategy classes with best parameters
-                    class TrainOptimizedStrategy(strategy_class):
-                        def __init__(self, *args, **kwargs):
-                            super().__init__(*args, **kwargs)
-                            for param, value in best_params.items():
-                                setattr(self, param, value)
-                                
-                        def init(self):
-                            super().init()
-                            
+                    # Create optimized strategy class with best parameters for testing
                     class TestOptimizedStrategy(strategy_class):
                         def __init__(self, *args, **kwargs):
                             super().__init__(*args, **kwargs)
@@ -541,34 +536,45 @@ class WalkForwardOptimizer:
                                 
                         def init(self):
                             super().init()
+                            # Store the test start date for filtering
+                            self._test_start_date = pd.Timestamp(train_end_date.date())
                             
                         def next(self):
-                            # Only trade during testing period (after training end date)
-                            # Use self.time property which accesses broker time
-                            if self.time >= pd.Timestamp(train_end_date.date()):
+                            # Only trade during testing period
+                            current_time = pd.Timestamp(self.time.date()) if hasattr(self.time, 'date') else self.time
+                            if current_time >= self._test_start_date:
                                 super().next()
                     
-                    # Run training backtest with optimized parameters
-                    train_bt = Backtest(db_path, TrainOptimizedStrategy,
-                                       cash=self.cash,
-                                       commission_per_contract=self.commission,
-                                       option_multiplier=75)
-                    train_stats = train_bt.run(start_date=train_start_date.strftime('%Y-%m-%d %H:%M:%S'), 
-                                             end_date=train_end_date.strftime('%Y-%m-%d %H:%M:%S'))
-
-                    # Run testing backtest with optimized parameters (from training start to test end for indicators)
+                    # Run testing backtest with optimized parameters (full period for indicators)
                     test_bt = Backtest(db_path, TestOptimizedStrategy,
-                                      cash=self.cash,
+                                      cash=cumulative_equity,  # Use cumulative equity as starting cash
                                       commission_per_contract=self.commission,
                                       option_multiplier=75)
                     test_stats = test_bt.run(start_date=train_start_date.strftime('%Y-%m-%d %H:%M:%S'), 
                                            end_date=test_end_date.strftime('%Y-%m-%d %H:%M:%S'))
                     
+                    # Also run training backtest for comparison
+                    class TrainOptimizedStrategy(strategy_class):
+                        def __init__(self, *args, **kwargs):
+                            super().__init__(*args, **kwargs)
+                            for param, value in best_params.items():
+                                setattr(self, param, value)
+                                
+                        def init(self):
+                            super().init()
+                    
+                    train_bt = Backtest(db_path, TrainOptimizedStrategy,
+                                       cash=cumulative_equity,
+                                       commission_per_contract=self.commission,
+                                       option_multiplier=75)
+                    train_stats = train_bt.run(start_date=train_start_date.strftime('%Y-%m-%d %H:%M:%S'), 
+                                             end_date=train_end_date.strftime('%Y-%m-%d %H:%M:%S'))
+                    
                 except Exception as bt_e:
                     break
                 
                 try:
-                    # Process results
+                    # Process results from testing period
                     trades = test_stats.get('_trades', pd.DataFrame())
                     if not trades.empty:
                         # Filter trades to testing period only
@@ -584,14 +590,37 @@ class WalkForwardOptimizer:
                         if not orders.empty:
                             orders_list.append(orders)
                     
-                    equity_curve = test_stats.get('_equity_curve')
-                    if equity_curve is not None and isinstance(equity_curve, (pd.Series, pd.DataFrame)) and not equity_curve.empty:
-                        # Filter equity curve to testing period only
-                        equity_curve = equity_curve[equity_curve.index >= train_end_date]
-                        if not equity_curve.empty:
-                            equity_pct_change = equity_curve.pct_change().dropna()
-                            if isinstance(equity_pct_change, (pd.Series, pd.DataFrame)) and not equity_pct_change.empty:
-                                equity_curves.append(equity_pct_change)
+                    # Extract equity curve from testing period
+                    test_equity_curve = test_stats.get('_equity_curve')
+                    if test_equity_curve is not None and not test_equity_curve.empty:
+                        # Extract the 'Equity' column if it's a DataFrame
+                        if isinstance(test_equity_curve, pd.DataFrame):
+                            if 'Equity' in test_equity_curve.columns:
+                                test_equity_values = test_equity_curve['Equity']
+                            else:
+                                test_equity_values = test_equity_curve.iloc[:, 0]
+                        else:
+                            test_equity_values = test_equity_curve
+                        
+                        # Filter to testing period only
+                        test_equity_values = test_equity_values[test_equity_values.index >= train_end_date]
+                        
+                        if not test_equity_values.empty:
+                            # Adjust equity values to be relative to the period start
+                            period_start_equity = cumulative_equity
+                            period_end_equity = test_equity_values.iloc[-1]
+                            
+                            # Scale the equity curve to start from cumulative_equity
+                            if test_equity_values.iloc[0] != 0:
+                                scaling_factor = period_start_equity / test_equity_values.iloc[0]
+                                scaled_equity = test_equity_values * scaling_factor
+                            else:
+                                scaled_equity = test_equity_values + period_start_equity
+                                
+                            equity_curves.append(scaled_equity)
+                            
+                            # Update cumulative equity for next period
+                            cumulative_equity = scaled_equity.iloc[-1]
 
                     # Create summary statistics
                     train_summary_stats = dict(train_stats)
@@ -669,44 +698,59 @@ class WalkForwardOptimizer:
             
             df_trades = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
 
-            # Create df_equity
+            # Create continuous equity curve from all testing periods
             if equity_curves:
-                df_equity = pd.concat(equity_curves)
+                # Concatenate all equity curves chronologically
+                df_equity = pd.concat(equity_curves).sort_index()
+                # Remove any duplicate timestamps
+                df_equity = df_equity[~df_equity.index.duplicated(keep='first')]
             else:
-                df_equity = pd.Series(dtype=float)
+                df_equity = pd.Series(dtype=float, name='Equity')
             
-            # Compute final statistics using data date range
+            # Compute final statistics using the continuous equity curve
             stats = None
-            if len(df_trades) > 0:
-                actual_equity_curve = (df_equity + 1).cumprod() * self.cash
-                # Create a simple date index for equity curve alignment
-                date_index = pd.date_range(start=data_start_date, end=data_end_date, freq='D')
-                if not actual_equity_curve.index.equals(date_index):
-                    actual_equity_curve = actual_equity_curve.reindex(date_index).ffill().bfill()
+            if len(df_trades) > 0 and not df_equity.empty:
+                # Create final equity curve DataFrame
+                equity_df = pd.DataFrame({'Equity': df_equity})
                 
-                # Convert to DataFrame if it's a Series, otherwise keep as is
-                if isinstance(actual_equity_curve, pd.Series):
-                    actual_equity_curve = actual_equity_curve.to_frame(name='Equity')
-                elif isinstance(actual_equity_curve, pd.DataFrame):
-                    # If it's already a DataFrame, ensure it has the right column name
-                    if actual_equity_curve.shape[1] == 1:
-                        actual_equity_curve.columns = ['Equity']
-                    else:
-                        # If multiple columns, take the first one and rename it
-                        actual_equity_curve = actual_equity_curve.iloc[:, 0].to_frame(name='Equity')
+                # Calculate returns for quantstats
+                returns = df_equity.pct_change().dropna()
                 
-                # For stats computation, we'll use a simplified approach since we don't have OHLC data
+                # Calculate basic statistics
+                total_return = ((df_equity.iloc[-1] / self.cash) - 1) * 100 if len(df_equity) > 0 else 0
+                
+                # Calculate drawdown
+                running_max = df_equity.expanding().max()
+                drawdown = (df_equity - running_max) / running_max * 100
+                max_drawdown = drawdown.min()
+                
                 stats = {
                     'Start': data_start_date,
                     'End': data_end_date,
                     'Duration': str(data_end_date - data_start_date),
-                    'Return [%]': ((actual_equity_curve['Equity'].iloc[-1] / self.cash) - 1) * 100 if len(actual_equity_curve) > 0 else 0,
-                    'Max Drawdown [%]': ((actual_equity_curve['Equity'].min() / actual_equity_curve['Equity'].cummax().max()) - 1) * 100 if len(actual_equity_curve) > 0 else 0,
+                    'Return [%]': total_return,
+                    'Max Drawdown [%]': max_drawdown,
                     '# Trades': len(df_trades),
-                    '_equity_curve': actual_equity_curve,
+                    '_equity_curve': equity_df,
                     '_trades': df_trades,
                     '_orders': df_orders,
-                    '_strategy': last_strategy
+                    '_strategy': last_strategy,
+                    '_returns': returns  # Add returns for tearsheet
+                }
+            else:
+                # Create empty stats if no trades
+                stats = {
+                    'Start': data_start_date,
+                    'End': data_end_date,
+                    'Duration': str(data_end_date - data_start_date),
+                    'Return [%]': 0,
+                    'Max Drawdown [%]': 0,
+                    '# Trades': 0,
+                    '_equity_curve': pd.DataFrame({'Equity': [self.cash]}),
+                    '_trades': pd.DataFrame(),
+                    '_orders': pd.DataFrame(),
+                    '_strategy': last_strategy,
+                    '_returns': pd.Series(dtype=float)
                 }
                 
             # Extract best parameters from the last strategy
@@ -1021,60 +1065,82 @@ class WalkForwardOptimizer:
                     filename = f"{stock}_{timeframe}.html"
                     tear_sheet_path = os.path.join(output_directory_path, filename)
                     
-                    # Convert DataFrame to Series if needed
-                    if isinstance(df_equity, pd.DataFrame):
-                        df_equity = df_equity.iloc[:, 0]
+                    # Get returns from stats for tearsheet
+                    returns_series = stats.get('_returns', pd.Series(dtype=float))
                     
-                    # Create benchmark
+                    # If no returns available, calculate from equity curve
+                    if returns_series.empty and not df_equity.empty:
+                        returns_series = df_equity.pct_change().dropna()
+                    
+                    # Create benchmark if possible
                     benchmark_series = None
                     try:
                         from core.backtesting_opt import _Data
                         data = _Data(db_path, start_date=start_date, end_date=end_date)
-                        daily_benchmark_data = []
+                        benchmark_data = []
                         
+                        # Create a simple benchmark from spot price data
                         for table in data._table_names:
                             try:
                                 data.load_table(table)
                                 if data._spot_table is not None and not data._spot_table.empty:
-                                    daily_spot = data._spot_table['spot_price'].resample('1D').last()
-                                    daily_benchmark_data.append(daily_spot)
+                                    # Resample spot prices to daily and calculate returns
+                                    daily_spot = data._spot_table['spot_price'].resample('1D').last().dropna()
+                                    benchmark_data.append(daily_spot)
                             except Exception as table_error:
-                                print(f"Warning: Could not load table {table}: {table_error}")
                                 continue
                         
                         data.close()
                         
-                        if daily_benchmark_data:
-                            benchmark_series = pd.concat(daily_benchmark_data).sort_index()
-                            benchmark_series = benchmark_series[~benchmark_series.index.duplicated(keep='first')]
-                            benchmark_series = benchmark_series.pct_change().dropna()
-                            benchmark_series = benchmark_series.rename("Benchmark")
-                            print(f"Created default benchmark with {len(benchmark_series)} data points")
+                        if benchmark_data:
+                            benchmark_prices = pd.concat(benchmark_data).sort_index()
+                            benchmark_prices = benchmark_prices[~benchmark_prices.index.duplicated(keep='first')]
+                            benchmark_returns = benchmark_prices.pct_change().dropna()
+                            
+                            # Align benchmark with strategy returns
+                            if not returns_series.empty:
+                                # Match the timeframe of the strategy returns
+                                common_dates = returns_series.index.intersection(benchmark_returns.index)
+                                if len(common_dates) > 0:
+                                    benchmark_series = benchmark_returns.reindex(common_dates).fillna(0)
+                                    returns_series = returns_series.reindex(common_dates)
+                                    benchmark_series = benchmark_series.rename("Benchmark")
+                                    print(f"Created benchmark with {len(benchmark_series)} aligned data points")
+                                else:
+                                    print("No overlapping dates between strategy and benchmark")
+                            else:
+                                benchmark_series = benchmark_returns.rename("Benchmark")
                         else:
-                            benchmark_series = None
                             print("No benchmark data available")
                     except Exception as e:
                         print(f"Warning: Could not create benchmark data: {e}")
                         benchmark_series = None
                         
-                    if quantstats:
+                    # Generate tearsheet with quantstats
+                    if quantstats and not returns_series.empty:
                         try:
                             quantstats.reports.html(
-                                df_equity, 
-                                stock_name=stock,
-                                timeframe=timeframe,
+                                returns_series, 
                                 benchmark=benchmark_series, 
                                 output=tear_sheet_path,
-                                strategy_title=f"{stock} Strategy",
-                                benchmark_title="Benchmark"
+                                title=f"{stock} Walk-Forward Optimization Results",
+                                compounded=True,
+                                periods_per_year=252,  # Trading days per year
+                                match_dates=True
                             )
+                            print(f"Tearsheet generated successfully: {tear_sheet_path}")
                         except Exception as qs_e:
-                            pass
+                            print(f"Error generating quantstats tearsheet: {qs_e}")
+                    else:
+                        print("Quantstats not available or no returns data")
                         
                 except Exception as e:
-                    pass
+                    print(f"Error generating tearsheet: {e}")
+            else:
+                print("No trades found - tearsheet not generated")
             
         except Exception as main_e:
+            print(f"Error in optimize_stock: {main_e}")
             raise
 
     def create_tearsheets(self):
