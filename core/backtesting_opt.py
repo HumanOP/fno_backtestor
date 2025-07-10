@@ -1725,9 +1725,6 @@ class Backtest:
 
         # Get trade data from results for position aggregation
         trade_table = results.get('_trades', pd.DataFrame())
-        if trade_table.empty:
-            raise ValueError("No trade data found in results. Cannot generate position tearsheet.")
-        
         # Convert trade data to DataFrame if it's not already
         if not isinstance(trade_table, pd.DataFrame):
             # Convert list of Trade objects to DataFrame
@@ -1748,6 +1745,8 @@ class Backtest:
                     'PnL': trade.pl
                 })
             trade_table = pd.DataFrame(trade_data)
+        if trade_table.empty:
+            raise ValueError("No trade data found in results. Cannot generate position tearsheet.")
         
         # Group trades by position_id to create position-level trade logs
         position_data = []
