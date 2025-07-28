@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), '..')))
@@ -41,8 +42,8 @@ class _Broker:
 
         self.active_order_ids={}
 
-        self.equity: float = 0.0
-        self.cash: float = 0.0
+        self._equity: float = 0.0
+        self._cash: float = 0.0
 
         # Connect to broker
         if not self._adapter.connect():
@@ -50,7 +51,7 @@ class _Broker:
             raise ConnectionError("Failed to connect to broker")
 
         # Set order fill callback
-        self._adapter.set_order_fill_callback(self.on_order_fill)
+        # self._adapter.set_order_fill_callback(self.on_order_fill)
         
         # Initialize account info
         self.update_account_info()
@@ -61,17 +62,21 @@ class _Broker:
     
     @property
     def spot(self) -> float:
-        return self._data._spot
+        return self.get_ticker_last_price(ticker="NIFTY50")  # Assuming NIFTY is the spot ticker
+    
+    @property
+    def active_trades(self) -> List[Trade]:
+        return [trade for trades_list in self.trades.values() for trade in trades_list]
     
     def __repr__(self):
         active_trades = sum(len(ts) for ts in self.trades.values())
-        return f'<Broker: Cash={self.cash:.2f}, Equity={self.equity:.2f} ({active_trades} open trades)>'
+        return f'<Broker: Cash={self._cash:.2f}, Equity={self._equity:.2f} ({active_trades} open trades)>'
 
     def update_account_info(self) -> dict:
         """Fetch comprehensive account information from the broker adapter."""
         try:
-            self.cash, self.equity = self._adapter.get_account_info()
-            logging.info(f"Account info updated: Cash={self.cash:.2f}, Equity={self.equity:.2f}")
+            self._cash, self._equity = self._adapter.get_account_info()
+            logging.info(f"Account info updated: Cash={self._cash:.2f}, Equity={self._equity:.2f}")
         except Exception as e:
             logging.error(f"Error updating account info: {str(e)}")
             return {}
@@ -116,8 +121,12 @@ class _Broker:
             print(f"Processing order: {order}")
             action = "BUY" if order.size > 0 else "SELL"
             required_margin = self.margin_impact(order.ticker, action, order.size)
-            if self.cash < required_margin:
-                warnings.warn(f"Not enough cash for {order}. Has {self.cash:.2f}, needs {required_margin:.2f}. Order skipped.")
+            if required_margin is None:
+                warnings.warn(f"Could not calculate margin impact for {order}. Order skipped.")
+                self.orders.remove(order)
+                continue
+            if self._cash < required_margin:
+                warnings.warn(f"Not enough cash for {order}. Has {self._cash:.2f}, needs {required_margin:.2f}. Order skipped.")
                 self.orders.remove(order)
                 continue
             
@@ -193,7 +202,7 @@ class _Broker:
             # warnings.warn(f"No data for option {ticker} in current chain. Order cannot fill.")
             return None
 
-        last_price = ticker_data.get('close')
+        last_price = ticker_data.get('last')
         if last_price!=None:
             return last_price
 
@@ -248,27 +257,61 @@ class _Broker:
         margin_impact = self._adapter.get_margin_impact(ticker, action, quantity)
         return margin_impact
 
-    def on_order_fill(self) -> None:
-        for order_id, order in self.active_order_ids.items():
-            # price = self.get_ticker_last_price(ticker=order.ticker)  # NOT CORRECT ----- ( this price we will get from ibkr's some function)
-            print(f"Checking trades: {self._adapter.get_trades()}")
-            for trade in self._adapter.get_trades():
-                if trade["orderStatus"].orderId == order_id and trade["orderStatus"].status == 'Filled': 
-                    if order.trade is None:
-                        self._open_trade(       # set new internal trade object
-                            order,
-                            entry_price=trade['fills'][0].execution.price,
-                            entry_datetime=trade['fills'][0].execution.time
-                        )
-                        self.active_order_ids.pop(order_id)
+    def equity(self, ticker: str = None) -> float: # MTM equity
+        if ticker:
+            return sum(trade.value for trade in self.trades.get(ticker, []))
+            # This seems simmilar to self.positions[ticker].pl
+        else:
+            mtm_value_of_open_positions = sum(trade.pl for trade in self.active_trades)
+            return self._cash + mtm_value_of_open_positions
+        
 
-                    else: 
-                        self._reduce_trade(     # reduce and set new internal trade object
-                            order,
-                            exit_price=trade['fills'][0].execution.price,
-                            exit_datetime=trade['fills'][0].execution.time
-                        )
-                        self.active_order_ids.pop(order_id)
+        
+    def on_order_fill(self) -> None:
+        # for trade in self._adapter.get_trades():
+        #     if trade['orderStatus'].status != 'Filled':
+        #         print("The unfulfilled trade: ", trade.get('orderStatus', {}))
+        #         continue
+            
+        #     for order_id, order in self.active_order_ids.items():             
+        #         # Update need: How to consider when multiple fills for the same order?
+        #         if trade['fills'][0].execution.orderId == order_id: 
+        #             if order.trade is None:
+        #                 print("The fulfilled trade: ", trade)
+        #                 self._open_trade(       # set new internal trade object
+        #                     order,
+        #                     entry_price=trade["fills"][0].execution.price,
+        #                     entry_datetime=pd.Timestamp(trade["fills"][0].execution.time)
+        #                 )
+        #                 self.active_order_ids.pop(order_id)
+
+        #             else: 
+        #                 print("The fulfilled trade: ", trade)
+        #                 self._reduce_trade(     # reduce and set new internal trade object
+        #                     order,
+        #                     exit_price=trade["fills"][0].execution.price,
+        #                     exit_datetime=pd.Timestamp(trade["fills"][0].execution.time)
+        #                 )
+        #                 self.active_order_ids.pop(order_id)
+
+        for order_id, order in self.active_order_ids.items():
+            price = self.get_ticker_last_price(ticker=order.ticker)  # NOT CORRECT ----- ( this price we will get from ibkr's some function)
+            if order.trade is None:
+                self._open_trade(       # set new internal trade object
+                    order,
+                    entry_price=price,
+                    entry_datetime=pd.Timestamp(time.time())
+                )
+                self.active_order_ids.pop(order_id)
+
+            else: 
+                self._reduce_trade(     # reduce and set new internal trade object
+                    order,
+                    exit_price=price,
+                    exit_datetime=pd.Timestamp(time.time())
+                )
+                self.active_order_ids.pop(order_id)
+
 
             
     def cancel_all_orders(self) -> None:
@@ -291,7 +334,7 @@ from io import BytesIO
 # Usage example
 if __name__ == "__main__":
     endpoint = Endpoint(
-        host='qdb3.twocc.in', 
+        host='qdb6.twocc.in', 
         https=True, 
         username='2Cents', 
         password='2Cents1012cc'
@@ -307,23 +350,37 @@ if __name__ == "__main__":
     # Initialize the IBKR adapter
     ibkr_adapter = IBKRBrokerAdapter(host='localhost', port=7497, client_id=1)
     try:
-        t = 10
         import time
-        broker = _Broker(option_multiplier=1, broker_adapter=ibkr_adapter,data=fetcher)
-        ticker = "NIFTY10JUL2525400CE"
-        order = broker.new_order("1","1","1", ticker, 75)
+
+        broker = _Broker(option_multiplier=75, broker_adapter=ibkr_adapter, data=fetcher)
+
+        # from ib_async import Contract
+        # ib_contract = Contract(symbol="NIFTY50", secType="OPT", exchange="NSE", currency="INR",
+        #                       lastTradeDateOrContractMonth="20250717", strike=25100.0, right="C")
+        # print(ibkr_adapter.ib.qualifyContracts(ib_contract))  # Ensure contract is valid
+        ticker = "NIFTY25JUL2525000CE"
+        broker.new_order("1","1","1", ticker, 75 )
+
         margin_impact = broker.margin_impact(ticker, action="BUY", quantity=75)
         print(f"Margin Impact for {ticker}: {margin_impact}")
-        while t>0:
-            t = t -1
-            broker.next()  # Process the order
-            
-            time.sleep(1)
-
-        # whatif = ibkr_adapter.ib.whatIfOrder(ib_contract, order)
-        # print(whatif)
-        # return float(whatif.initMarginChange) if whatif and whatif.initMarginChange else None
         
+        broker.next()  # Process the order
+        print(broker.active_order_ids)
+        print(f" time: {broker.time}, spot: {broker.spot}")
+
+        time.sleep(10)
+        broker.next()  # Process the order
+        print(broker.active_order_ids)
+        print(f" time: {broker.time}, spot: {broker.spot}")
+
+        time.sleep(10)
+        broker.next()  # Process the order
+        print(f" time: {broker.time}, spot: {broker.spot}")
+
+        time.sleep(10)
+        broker.next()  # Process the order
+        print(f" time: {broker.time}, spot: {broker.spot}")
+
     except Exception as e:
         print(f"Error: {e}")
         traceback.print_exc()
