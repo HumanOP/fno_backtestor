@@ -460,7 +460,9 @@ class Trade:
         self.__exit_tag: Optional[str] = None
 
 
-
+    def __repr__(self):
+        return (f'<Trade {self.__ticker} Size={self.__size} EntryDatetime={self.__entry_datetime} ExitDatetime={self.__exit_datetime or ""} '
+                f'EntryPrice={self.__entry_price:.2f} ExitPrice={self.__exit_price or "":.2f} PnL={self.pl:.2f} Tag={self.__entry_tag or ""}>')
 
     def _replace(self, **kwargs): # Keep
         for k, v in kwargs.items():
