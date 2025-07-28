@@ -1,9 +1,14 @@
 *.duckdb
+*.log
+*.txt
+*.csv
 
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+qdb_data
 
 # test files
 forward_testing.py
