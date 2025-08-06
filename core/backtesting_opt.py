@@ -461,8 +461,14 @@ class Trade:
 
 
     def __repr__(self):
-        return (f'<Trade {self.__ticker} Size={self.__size} EntryDatetime={self.__entry_datetime} ExitDatetime={self.__exit_datetime or ""} '
-                f'EntryPrice={self.__entry_price:.2f} ExitPrice={self.__exit_price or "":.2f} PnL={self.pl:.2f} Tag={self.__entry_tag or ""}>')
+        entry_price = f"{self.__entry_price:.2f}" if isinstance(self.__entry_price, (int, float)) else "None"
+        exit_price = f"{self.__exit_price:.2f}" if isinstance(self.__exit_price, (int, float)) else "None"
+        pnl = f"{self.pl:.2f}" if isinstance(self.pl, (int, float)) else "None"
+        
+        return (f'<Trade {self.__ticker} Size={self.__size} EntryDatetime={self.__entry_datetime} '
+                f'ExitDatetime={self.__exit_datetime or "None"} EntryPrice={entry_price} '
+                f'ExitPrice={exit_price} PnL={pnl} Tag={self.__entry_tag or "None"}>')
+
 
     def _replace(self, **kwargs): # Keep
         for k, v in kwargs.items():
