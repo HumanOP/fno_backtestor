@@ -1,4 +1,4 @@
-# FNO Trading Infrastructure
+# FnO Trading Infrastructure
 
 A powerful and optimized framework for professional-grade F&O (Futures and Options) trading, covering the entire lifecycle from strategy research to live execution.
 
