@@ -1,79 +1,43 @@
-# Backtesting Framework
-## Overview
-This repository contains the backtesting framework. It provides tools and utilities for testing, analyzing, and reporting on trading strategies.
+# FNO Trading Infrastructure
 
-## Project Structure
+A powerful and optimized framework for professional-grade F&O (Futures and Options) trading, covering the entire lifecycle from strategy research to live execution.
 
-```
-backtestor/
-├── core/                     # Core utilities and classes for backtesting
-├── examples/                 # Examples of how to run code
-├── <strategy name>/          # Strategy wise backtesting scripts and analysis
-└── report/                   # Output results, charts, and reports
-```
+## 🚀 Key Features
 
-## Directory Overview
+- **High-Performance Backtesting**: Optimized engine for complex option strategies with high-speed simulation.
+- **Live & Paper Trading**: Native Interactive Brokers (IBKR) integration (Sync/Async adapters) for seamless transition to production.
+- **Optimisation Module**: Robust Walk Forward Optimization (WFO) and automated Hyperparameter tuning to validate and refine strategies.
+- **Advanced Risk Management**: Integrated controls including Greeks-based capping, exposure monitoring, and position tracking.
+- **Data Engineering**: Comprehensive pipeline for real-time market data fetching and persistence (Redis, DuckDB for local, and QuestDB for global storage).
+- **Reporting & Analytics**: Professional-grade performance reporting using `QuantStats` and custom statistical builders.
 
-### Core
-Contains common utility classes, data processors, strategy implementations, and other reusable components used across the backtesting framework.
+## 📂 Project Structure
 
-### Scripts
-Executable Python scripts for running backtest simulations. These scripts typically import from the core module and generate outputs stored in the report directory.
-
-### Notebooks
-Jupyter notebooks for data exploration, strategy analysis, and visualization of results. These are ideal for prototyping new ideas and generating visualizations.
-
-### Report
-Contains the output of backtests, including performance metrics, charts, logs, and other generated artifacts.
-
-## Path Management
-
-When working with this project, proper path management is required to ensure modules can be imported correctly.
-
-### For Python Scripts
-
-When creating a script in a nested directory, add this at the top of your file to ensure imports work correctly:
-
-```python
-import os
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-# Now you can import from core
-from core.some_module import SomeClass
+```text
+fno_backtestor/
+├── core/                   # Infrastructure Core
+│   ├── fw_testing/         # Live/Paper Trading & IBKR Adapters
+│   ├── data_uploader/      # Data Pipelines & Persistence
+│   ├── backtesting_opt.py  # Backtesting Engine
+│   ├── risk_manager.py     # Advanced Risk Management
+│   └── quantstats/         # Analytics & Reporting
+├── strategies/             # Strategy Implementation & Research
+├── demos/                  # End-to-end usage examples
+└── README.md               # Infrastructure Documentation
 ```
 
-### For Jupyter Notebooks
+## 🛠️ Getting Started
 
-When working with Jupyter notebooks in a nested directory, add this at the beginning of your notebook:
+### 1. Prerequisites
+- Python 3.8+
+- [Interactive Brokers TWS/Gateway](https://www.interactivebrokers.com/en/trading/tws.php)
 
-```python
-import os
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.getcwd(), '..')))
-
-# Now you can import from core
-from core.some_module import SomeClass
+### 2. Installation
+```bash
+git clone https://github.com/HumanOP/fno_backtestor.git
+pip install -r requirements.txt
 ```
 
-## Getting Started
+## 🏗️ Contributing
 
-1. Clone the repository
-2. Set up your Python environment (Python 3.x recommended)
-3. Install required dependencies: `pip install -r requirements.txt` (if applicable)
-4. Run backtests using scripts in the `scripts/` directory
-5. Analyze results using notebooks or by examining outputs in the `report/` directory
-
-## Contributing
-
-When adding new components:
-
-1. Place reusable code in the `core/` directory
-2. Create executable backtests in the `scripts/` directory
-3. Place exploratory analysis in the `notebooks/` directory
-4. Store all results in the `report/` directory
-5. Follow the path management guidelines above for imports
-
-<!-- ## License
-
-[Add appropriate license information] -->
+For detailed guidelines on how to run demos, add new strategies, or extend the core infrastructure, please refer to [CONTRIBUTING.md](./CONTRIBUTING.md).
