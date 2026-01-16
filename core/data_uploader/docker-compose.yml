@@ -1,0 +1,16 @@
+# version: "3.8"
+services:
+  questdb:
+    image: questdb/questdb:latest
+    container_name: questdb
+    ports:
+      - "9000:9000"    # Web UI & REST API
+      - "8812:8812"    # Postgres wire protocol
+      - "9009:9009"    # InfluxDB line protocol
+      - "9003:9003"    # Health/metrics
+    volumes:
+      - ./qdb_data:/var/lib/questdb  # persists data to ./qdb_data in your current directory
+    environment:
+      - QDB_PG_USER=admin
+      - QDB_PG_PASSWORD=quest
+    restart: unless-stopped

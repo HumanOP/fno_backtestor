@@ -165,23 +165,26 @@ class _Data:
     """Main class for fetching data with strategies"""
     def __init__(self, endpoint: Endpoint):
         self.consumer = QuestDBClient(endpoint)
-        
+        # self._time: Optional[pd.Timestamp] = None
+        # self._spot: Optional[float] = None
+
     def get_ticker_data(self, ticker: str, limit: int = 1) -> Optional[bytes]:
         query = f"SELECT * FROM {ticker} ORDER BY ts DESC LIMIT {limit}"
+        ticker_data = self.consumer.execute_query(query)
         try:
-            return self.consumer.execute_query(query)
+            return pd.read_csv(BytesIO(ticker_data), nrows=1).squeeze().to_dict()
         except Exception as e:
             print(f"Error fetching data for {ticker}: {e}")
             return None
 
-    def cleanup(self):
+    def close(self):
         self.consumer.cleanup()
 
 
 # Usage example
 if __name__ == "__main__":
     endpoint = Endpoint(
-        host='qdb3.twocc.in', 
+        host='qdb6.twocc.in', 
         https=True, 
         username='2Cents', 
         password='2Cents1012cc'
@@ -200,3 +203,9 @@ if __name__ == "__main__":
         if ticker_data:    
             end = time.time()
             print(f"Time taken: {end - start:.5f} seconds")
+    # spot = QuestDBClient(endpoint).execute_query(f"SELECT * FROM NIFTY50 ORDER BY ts DESC LIMIT 1")
+    # # df = pd.read_csv(BytesIO(spot)).to_dict(orient='records')[0]
+    # df = pd.read_csv(BytesIO(spot), nrows=1).squeeze().to_dict()
+
+    # # table_names = df["table_name"].tolist()
+    # print(df['last'])  # Assuming 'last' is the column for last price

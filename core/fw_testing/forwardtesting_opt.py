@@ -4,8 +4,6 @@ from datetime import datetime, date as DateObject # Added DateObject
 
 from abc import ABC, abstractmethod
 import pandas as pd
-from typing import Dict, Optional, List
-import pandas as pd
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 from io import BytesIO
@@ -18,7 +16,8 @@ import atexit
 import threading
 
 from live_data_fetcher import _Data, Endpoint
-from sync_ibkr_br_adapter import _Broker
+from sync_broker import _Broker
+from core.backtesting_opt import Order,Trade,Position
 
 class Strategy(ABC):
     def __init__(self, 
@@ -75,16 +74,17 @@ class Strategy(ABC):
         return self._broker.new_order(strategy_id, position_id, leg_id, ticker, -quantity, stop_loss, take_profit, tag)
 
     @property
-    def time(self):
-        return time.time()
+    def time(self): # Current spot data timestamp
+        return pd.Timestamp.now()
     
     @property
-    def spot(self):
-        return self._data._spot         # Needs redefinition to getting underlying's data
+    def spot(self) -> float:
+        return self.get_ticker_data(ticker="NIFTY50")  # Assuming NIFTY is the spot ticker
 
     @property
     def tte_to_expiry(self):
-        return self._data._tte_to_expiry
+        raise NotImplementedError("Subclasses should implement tte_to_expiry mapping")
+        # return self._data._tte_to_expiry
 
     def get_ticker_data(self, ticker: str) -> Optional[pd.DataFrame]:
         """Fetch historical data for a specific ticker contract."""
@@ -92,33 +92,37 @@ class Strategy(ABC):
 
     @property
     def equity(self) -> float:          # MTM of all positions
-        return self._broker.equity
+        return self._broker._equity
     
     @property
     def cash(self) -> float:
         """Get the current cash balance in the broker account."""
-        return self._broker.cash
+        return self._broker._cash
 
     @property
-    def orders(self):
+    def equity(self) -> float:
+        return self._broker.equity()
+
+    def position(self, ticker: str) -> 'Position': # Now takes ticker
+        return self._broker.positions.get(ticker, Position(self._broker, ticker, 0)) # Return empty if not found
+
+    @property
+    def orders(self) -> 'List[Order]':
         return self._broker.orders
 
-    # def trades(self, ticker: str = None):
-    #     if ticker: # This property is not working as of now.
-    #         return self._broker.trades.get(ticker, [])
-    #     return self._broker.trades
+    # trades() and closed_trades() now refer to option trades
+    def trades(self, ticker: str = None) -> 'Tuple[Trade, ...]':
+        if ticker:
+            return tuple(self._broker.trades.get(ticker, []))
+        return tuple(trade for trades_list in self._broker.trades.values() for trade in trades_list)
     
-    # @property
-    # def position(self, ticker: str):
-    #     return self._broker.positions.get(ticker, Position(self._broker, ticker, 0)) # Return empty if not found
+    @property
+    def active_trades(self) -> 'Tuple[Trade, ...]':
+        return tuple(trade for trades_list in self._broker.trades.values() for trade in trades_list)
 
-    # @property
-    # def active_trades(self) -> 'Tuple[Trade, ...]':
-    #     return tuple(trade for trades_list in self._broker.trades.values() for trade in trades_list)
-
-    # @property
-    # def closed_trades(self) -> 'Tuple[Trade, ...]':
-    #     return tuple(self._broker.closed_trades)
+    @property
+    def closed_trades(self) -> 'Tuple[Trade, ...]':
+        return tuple(self._broker.closed_trades)
 
 
 class AlgoRunner:
@@ -130,7 +134,7 @@ class AlgoRunner:
                  broker_adapter,
                  option_multiplier: int = 75,
                  update_interval: float = 1.0,
-                 end_time: pd.Timestamp = pd.Timestamp('15:30:00')):
+                 end_time: pd.Timestamp = pd.Timestamp('15:31:00')):
         self.endpoint = endpoint
         self._strategy = strategy
         self.broker_adapter = broker_adapter
@@ -138,14 +142,16 @@ class AlgoRunner:
         self.update_interval = update_interval
         self.end_time = end_time
 
-    def run(self, **strategy_params):
+    def run(self, **strategy_kwargs):
         """Run the strategy in real-time"""
         print("Starting forward testing...")
         
         # Initialize components
         self._data = _Data(self.endpoint)
-        self._broker = _Broker(broker_adapter=self.broker_adapter, option_multiplier= 75)
-        self._strategy = self._strategy(self._broker, self._data, strategy_params)
+        self._broker = _Broker(data=self._data, broker_adapter=self.broker_adapter, option_multiplier=self.option_multiplier)
+        self._strategy = self._strategy(self._broker, self._data, strategy_kwargs)
+        processed_orders: List[Order] = []
+        equity_curve = pd.Series(dtype=float)
         
         try:
             # Initialize strategy
@@ -167,10 +173,12 @@ class AlgoRunner:
 
                 # Update broker state (positions, orders, etc.)
                 self._broker.next()
+                equity_curve[loop_start_time] = self._broker.equity()
 
                 # Call strategy next() method
                 try:
                     self._strategy.next()
+                    processed_orders.extend(self._broker.orders)
                 except Exception as e:
                     print(f"Error in strategy.next(): {e}")
                     traceback.print_exc()
@@ -199,16 +207,19 @@ class AlgoRunner:
                 time.sleep(self.update_interval)
 
         print("Forward testing completed")
-        self.cleanup()
+        self.close()
+        equity_curve = equity_curve.sort_index()
+
+        return processed_orders, self._broker.closed_trades, equity_curve
 
     def stop(self):
         """Stop the algorithm"""
         self._is_running = False
 
-    def cleanup(self):
+    def close(self):
         """Cleanup resources"""
         if self._data:
-            self._data.cleanup()
+            self._data.close()
 
         if self._broker:
             self._broker.disconnect()
@@ -221,4 +232,12 @@ class AlgoRunner:
 - Handle different markets and timezones.
 - Persist results and equity curves for monitoring and analysis.
 - Control features like termination, pausing, and resuming, squaring off spreads/positions and squaring off current positions.
+'''
+
+
+'''
+1. How to get current algo updates
+2. What things to test?
+3. How to implement tte to expiry mapping?
+4. How is blocking implemented?
 '''

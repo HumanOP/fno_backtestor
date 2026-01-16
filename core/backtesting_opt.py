@@ -275,7 +275,6 @@ class Strategy(ABC):
     def active_trades(self) -> 'Tuple[Trade, ...]':
         return tuple(trade for trades_list in self._broker.trades.values() for trade in trades_list)
 
-
     @property
     def closed_trades(self) -> 'Tuple[Trade, ...]':
         return tuple(self._broker.closed_trades)
@@ -1036,7 +1035,7 @@ class Backtest:
                 # Strategy decision making
                 try:
                     strategy.next()
-                    processed_orders.extend(broker.orders)
+                    processed_orders.extend(broker.orders)     # UPDATE NEEDED: orders should be uniques so use set
                 except Exception as e:
                     print(f"Error in strategy.next() on {table}: {e}")
                     traceback.print_exc()

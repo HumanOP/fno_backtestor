@@ -8,8 +8,11 @@ import pandas as pd
 from typing import Dict, Optional, List, Any
 import time
 import logging
-from ib_async import IB, Contract, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, Order, Trade, Fill
+from ib_async import IB, Contract, MarketOrder, LimitOrder, StopOrder, StopLimitOrder, Order, Trade, Fill, Execution
 import re
+import asyncio
+import threading
+# import nest_asyncio
 
 class IBKRBrokerAdapter:
     """Interactive Brokers-specific broker adapter implementation - Synchronous version."""
@@ -23,12 +26,28 @@ class IBKRBrokerAdapter:
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         self.reconnect_delay = 10
-        self._order_fill_callback = None
+        # self._order_fill_callback = None
+        # self.set_order_fill_callback()
+        # self.set_handle_order_status()
+        # self.ib.run()
+        # self.ib.execDetailsEvent += self.exec_status
+        # self._connected = threading.Event()
+
+
 
     def connect(self) -> bool:
         """Establish connection to IBKR."""
         try:
+            # self.thread = threading.Thread(target=self._start_loop, daemon=True)
+            # self.thread.start()
+
+            # # Wait max 10 seconds for connection to complete
+            # if not self._connected.wait(timeout=10):
+            #     logging.error("Timeout: IBKR connection not established in time.")
+            #     return False
+
             self.ib.connect(self.host, self.port, clientId=self.client_id)
+
             self.is_connected = True
             logging.info("Connected to IBKR successfully")
             return True
@@ -36,6 +55,15 @@ class IBKRBrokerAdapter:
             logging.error(f"Connection failed: {str(e)}")
             self.is_connected = False
             return False
+        
+    # def _start_loop(self):
+    #     """Start the IBKR event loop in a separate thread."""
+    #     import asyncio
+    #     asyncio.set_event_loop(asyncio.new_event_loop())
+    #     self.ib.connect(self.host, self.port, clientId=self.client_id)
+    #     self.ib.execDetailsEvent += self.exec_status
+    #     self._connected.set()
+    #     self.ib.run()  # This blocks but inside a thread
 
     def reconnect(self) -> bool:
         """Attempt to reconnect to IBKR."""
@@ -287,10 +315,10 @@ class IBKRBrokerAdapter:
         except Exception as e:
             logging.error(f"Error cancelling orders: {str(e)}")
 
-    def set_order_fill_callback(self, callback):
-        """Set callback for order fill events."""
-        self._order_fill_callback = callback
-        self.ib.execDetailsEvent += self._on_exec_details
+    # def set_order_fill_callback(self):
+    #     """Set callback for order fill events."""
+    #     # self._order_fill_callback = callback
+    #     self.ib.execDetailsEvent += self._on_exec_details
 
     # def _on_exec_details(self, trade: 'Trade', fill: 'Fill'):
     #     """Handle IBKR execution details and invoke callback."""
@@ -302,13 +330,25 @@ class IBKRBrokerAdapter:
     #             ticker=trade.contract.localSymbol
     #         )
 
-    def _on_exec_details(self, **kwargs):
-        """Handle IBKR execution details and invoke callback."""
-        print(f"Execution outcome: {kwargs}")
+    # def exec_status(self, trade: Trade, fill: Fill):
+    #     print(f"Order filled: {trade.contract.localSymbol}, Filled: {fill.execution.cumQty}/{trade.order.totalQuantity}, Price: {fill.execution.price}")
+
+    # def _on_exec_details(self, execution: 'Execution'):
+    #     print("=== EXECUTION RECEIVED ===")
+    #     print(f"Execution ID: {execution}")
+
+    # def set_handle_order_status(self):
+    #     """Set callback for order status updates."""
+    #     self.ib.orderStatusEvent += self._on_order_status
+
+    # def _on_order_status(self, orderstatus):
+    #     """Handle order status updates."""
+    #     print(f"Order Status: {orderstatus}")
 
     def disconnect(self) -> None:
         """Disconnect from IBKR."""
         try:
+            # self.loop.call_soon_threadsafe(self.ib.disconnect)
             self.ib.disconnect()
             self.is_connected = False
             logging.info("Disconnected from IBKR")

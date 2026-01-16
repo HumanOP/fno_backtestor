@@ -1,5 +1,7 @@
 import asyncio
 import nest_asyncio
+nest_asyncio.apply()    # Quick fix for the script to run
+
 import logging
 import random
 import requests
@@ -14,9 +16,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict
 from collections import deque
-
-# Patch asyncio for Jupyter-style environments
-nest_asyncio.apply()
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +43,7 @@ class OptionChainListener:
         exchange: str = "NSE",
         currency: str = "INR",
         strike_range: float = 200,
+        https: bool = True,
         questdb_host: str = None,
         questdb_port: str = None,
         questdb_username: str = None,
@@ -67,16 +67,52 @@ class OptionChainListener:
         self.sender = None  # Persistent QuestDB sender
 
         # QuestDB connection settings
+        self.questdb_protocol = 'https' if https else 'http'
         self.questdb_host = questdb_host or os.getenv("QUESTDB_HOST", "localhost")
-        self.questdb_port = questdb_port or os.getenv("QUESTDB_PORT", "9009")
+        self.questdb_port = questdb_port or os.getenv("QUESTDB_PORT", "9000")
         self.questdb_username = questdb_username or os.getenv("QUESTDB_USERNAME", "admin")
         self.questdb_password = questdb_password or os.getenv("QUESTDB_PASSWORD", "quest")
         self.questdb_conf = (
-            f"https::addr={self.questdb_host}:{self.questdb_port};"
+            f"{self.questdb_protocol}::addr={self.questdb_host}:{self.questdb_port};"
             f"username={self.questdb_username};"
             f"password={self.questdb_password};"
             f"connect_timeout=5000;"
         )
+
+    def ticker_builder(self, underlying, expiry_date, strike, right):
+        """
+        Build option ticker string from components.
+        Example output: NIFTY25JUL2525400CE
+        """
+
+        # Map underlying back to original format
+        if underlying == "NIFTY50":
+            underlying = "NIFTY"
+
+        # Expiry date: YYYYMMDD -> DDMMMYY
+        year = expiry_date[:4]
+        month = expiry_date[4:6]
+        day = expiry_date[6:8]
+        month_map = {
+            '01': 'JAN', '02': 'FEB', '03': 'MAR', '04': 'APR',
+            '05': 'MAY', '06': 'JUN', '07': 'JUL', '08': 'AUG',
+            '09': 'SEP', '10': 'OCT', '11': 'NOV', '12': 'DEC'
+        }
+        month_abbr = month_map[month]
+        year_short = year[2:]
+
+        expiry_str = f"{day}{month_abbr}{year_short}"
+
+        # Strike (avoid .0 for integer values)
+        strike_str = f"{int(strike)}"
+
+        # Option type
+        option_type = "CE" if right.upper() == "C" else "PE"
+
+        # Final ticker
+        ticker = f"{underlying}{expiry_str}{strike_str}{option_type}"
+        return ticker
+
 
     def create_table_for_symbol(self, symbol: str, is_underlying: bool = False):
         """Create a QuestDB table for a symbol (option or underlying)."""
@@ -86,7 +122,7 @@ class OptionChainListener:
         with table_lock:
             if symbol in created_tables:
                 return
-            url = f"https://{self.questdb_host}:443/exec"
+            url = f"https://{self.questdb_host}:{self.questdb_port}/exec"
             if is_underlying:
                 ddl = f'''
                 CREATE TABLE IF NOT EXISTS "{symbol}" (
@@ -190,7 +226,7 @@ class OptionChainListener:
                 with Sender.from_conf(self.questdb_conf) as sender:
                     if option_rows:
                         for row in option_rows:
-                            symbol = row["Symbol"]
+                            symbol = self.ticker_builder(row["Underlying"], row["Expiration"], row["Strike"], row["Right"])
                             if symbol not in created_tables:
                                 self.create_table_for_symbol(symbol, is_underlying=False)
                             sender.row(
@@ -272,10 +308,12 @@ class OptionChainListener:
             greeks = ticker.modelGreeks or type("G", (), {})()
             now = datetime.now(pytz.timezone('UTC'))
             is_call = ticker.contract.right == "C"
+            logger.info(f"ticker: {ticker}")
             row = {
                 "ts": ticker.time,
                 "systemTime": now,
                 "Symbol": ticker.contract.localSymbol,
+                "Underlying": ticker.contract.symbol,
                 "Strike": ticker.contract.strike,
                 "Right": ticker.contract.right,
                 "Expiration": ticker.contract.lastTradeDateOrContractMonth,
@@ -298,7 +336,7 @@ class OptionChainListener:
                 "Theta": getattr(greeks, "theta", None),
                 "ImpliedVol": getattr(greeks, "impliedVol", None),
             }
-            logger.info(f"on_tick: ticker.time={ticker.time}, systemTime={now}")
+            logger.info(f"on_tick: ticker={ticker.contract.localSymbol} ticker_last={ticker.last} ticker_bid={ticker.bid} ticker_ask={ticker.ask} ticker_time={ticker.time}, systemTime={now}")
             if row["ts"] is None:
                 logger.warning(f"Skipping tick with missing timestamp: {row['Symbol']}")
                 return
@@ -342,7 +380,7 @@ class OptionChainListener:
             try:
                 start = time.perf_counter()
                 logger.info(f"Connecting to TWS (clientId={client_id})")
-                self.ib.connect("127.0.0.1", 7496, clientId=client_id, timeout=10)
+                self.ib.connect("127.0.0.1", 7497, clientId=client_id, timeout=10)
                 logger.info("Connected to TWS")
 
                 await self.ensure_sender()
@@ -389,7 +427,7 @@ class OptionChainListener:
                     if not contract.localSymbol:
                         logger.error(f"Failed to qualify contract: {contract}")
                     else:
-                        symbol = contract.localSymbol
+                        symbol = self.ticker_builder(contract.symbol,  contract.lastTradeDateOrContractMonth, contract.strike, contract.right)
                         self.create_table_for_symbol(symbol, is_underlying=False)
                         # time.sleep(0.1)
                         logger.info(f"Created table for option symbol: {symbol}")
@@ -447,7 +485,12 @@ async def main():
     ib = IB()
     listener = OptionChainListener(
         ib_client=ib,
-        questdb_host="qdb3.twocc.in",
+        # questdb_host="localhost",
+        # questdb_port="9000",
+        # questdb_username="admin",
+        # questdb_password="quest",
+        https=True,             # True for remote qdb and False for local dockerised qdb
+        questdb_host="qdb6.twocc.in",
         questdb_port="443",
         questdb_username="2Cents",
         questdb_password="2Cents1012cc"
@@ -459,4 +502,5 @@ async def main():
         listener.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # asyncio.run(main())
+    asyncio.get_event_loop().run_until_complete(main())
